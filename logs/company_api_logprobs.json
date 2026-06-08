@@ -1,0 +1,15 @@
+{
+  "logprobs": {
+    "requested": false,
+    "top_logprobs_requested": null,
+    "retry_without_logprobs": false,
+    "available": false,
+    "reason": "Logprobs were not requested for this request purpose."
+  },
+  "request_id": "eda39b2faf",
+  "timestamp": "2026-06-05T10:26:59.307892+00:00",
+  "purpose": "conclusion",
+  "provider": "openai_api_like",
+  "model": "voyager-1.6-preview-run27m4a8b4-r3",
+  "endpoint": "http://192.168.101.15:9898/v1/chat/completions"
+}

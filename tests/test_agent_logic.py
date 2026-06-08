@@ -598,6 +598,78 @@ def test_rerun_conversation_forces_required_tool_when_model_answers_text() -> No
     )
 
 
+def test_targeted_rerun_handles_consecutive_assistant_turn_with_required_tool() -> None:
+    data = ConversationData(
+        system_prompt="Use tools.",
+        interactions=[
+            Interaction(role="user", content="Saya mau tanya promo personal loan."),
+            Interaction(role="assistant", content="Boleh saya tahu nama Ibu?"),
+            Interaction(role="user", content="Almah"),
+            Interaction(role="assistant", content="Baik, Ibu Almah. Mohon tunggu sebentar."),
+            Interaction(role="assistant", content="Old factual promotion answer with Pinjaman Serbaguna limit."),
+        ],
+        tools={
+            "MandiriCX_Call_Center_search_promotion": {
+                "type": "function",
+                "function": {
+                    "name": "MandiriCX_Call_Center_search_promotion",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            }
+        },
+    )
+    old_preflight = agent_logic._preflight_company_rerun_request
+    old_chat_text = agent_logic._chat_text
+    captured = {}
+
+    def fake_preflight(**kwargs):
+        captured["messages"] = kwargs["messages"]
+        captured["tool_choice"] = kwargs["tool_choice"]
+
+    def fake_chat_text(**kwargs):
+        return "Old-style natural answer."
+
+    agent_logic._preflight_company_rerun_request = fake_preflight
+    agent_logic._chat_text = fake_chat_text
+    try:
+        results = rerun_conversation(
+            data=data,
+            optimized_prompt=data.system_prompt,
+            llm_settings=LLMSettings(
+                backend="company_api",
+                model="m",
+                provider="p",
+                base_url="http://example.test",
+            ),
+            target_assistant_turn_indices={4},
+            required_tools_by_turn={4: "MandiriCX_Call_Center_search_promotion"},
+        )
+    finally:
+        agent_logic._preflight_company_rerun_request = old_preflight
+        agent_logic._chat_text = old_chat_text
+
+    assert len(results) == 1
+    assert results[0].user_turn_index == 2
+    assert results[0].assistant_turn_index == 4
+    assert results[0].old_assistant_response == "Old factual promotion answer with Pinjaman Serbaguna limit."
+    assert "promo personal loan" in results[0].new_assistant_response
+    assert "Pinjaman Serbaguna" in results[0].new_assistant_response
+    assert captured["messages"][1:5] == [
+        {"role": "user", "content": "Saya mau tanya promo personal loan."},
+        {"role": "assistant", "content": "Boleh saya tahu nama Ibu?"},
+        {"role": "user", "content": "Almah"},
+        {"role": "assistant", "content": "Baik, Ibu Almah. Mohon tunggu sebentar."},
+    ]
+    assert captured["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "MandiriCX_Call_Center_search_promotion"},
+    }
+
+
 def test_prompt_edit_uses_exact_replace_patch() -> None:
     old_chat_json = agent_logic._chat_json
     calls = []
@@ -1028,6 +1100,37 @@ def test_build_conclusion_payload_structures_paragraph_evidence() -> None:
         "token-probability" in hint
         for hint in paragraph_inputs["paragraph_3_next_recommendation"]["observed_root_cause_hints"]
     )
+
+
+def test_build_conclusion_payload_marks_rerun_only_when_prompt_unchanged() -> None:
+    prompt = "Every promotion message requires search_promotion before answering."
+    payload = _build_conclusion_payload(
+        data=ConversationData(
+            system_prompt=prompt,
+            interactions=[Interaction(role="user", content="Any promo?")],
+        ),
+        before_prompt=prompt,
+        optimized_prompt=prompt,
+        rerun_results=[
+            RerunTurn(
+                user_turn_index=0,
+                assistant_turn_index=1,
+                user_message="Any promo?",
+                old_assistant_response="Here are promotion details.",
+                new_assistant_response='<function-call>search_promotion:{"query":"Any promo?"}</function-call>',
+            )
+        ],
+        updated_interactions=[Interaction(role="user", content="Any promo?")],
+        post_rerun_bad_cases=[],
+        applied_feedback_summary="No new system-prompt version was needed; reran the target assistant turn.",
+        post_rerun_scan_status="not_run",
+    )
+
+    changes = payload["paragraph_inputs"]["paragraph_1_changes"]
+
+    assert changes["prompt_changed"] is False
+    assert changes["prompt_diff"] == ""
+    assert "conversation-only" in changes["instruction"]
 
 
 def test_write_conclusion_dialog_log_exports_compress_dialog() -> None:

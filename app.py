@@ -188,6 +188,7 @@ def init_state() -> None:
         "company_models": [],
         "company_models_error": None,
         "bad_case_selection_error": None,
+        "pending_trace_scroll_restore": False,
         "toast_notifications": [],
     }
     for key, value in defaults.items():
@@ -248,6 +249,39 @@ def clear_legacy_anchor_hash(anchor: str) -> None:
                     parentWindow.location.pathname + parentWindow.location.search
                 );
             }}
+        }} catch (error) {{}}
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def request_trace_scroll_restore() -> None:
+    st.session_state.pending_trace_scroll_restore = True
+
+
+def render_trace_scroll_restore(anchor_id: str = "trace-list-top") -> None:
+    if not st.session_state.get("pending_trace_scroll_restore"):
+        return
+    st.session_state.pending_trace_scroll_restore = False
+    safe_anchor_id = json.dumps(anchor_id)
+    components.html(
+        f"""
+        <script>
+        try {{
+            const parentWindow = window.parent || window;
+            const parentDocument = parentWindow.document;
+            const anchorId = {safe_anchor_id};
+            const restore = () => {{
+                const target = parentDocument.getElementById(anchorId);
+                if (!target) return;
+                target.scrollIntoView({{ behavior: 'auto', block: 'start', inline: 'nearest' }});
+                parentWindow.scrollBy(0, -12);
+            }};
+            parentWindow.requestAnimationFrame(restore);
+            parentWindow.setTimeout(restore, 60);
+            parentWindow.setTimeout(restore, 180);
         }} catch (error) {{}}
         </script>
         """,
@@ -854,12 +888,49 @@ def refresh_company_models(url: str) -> None:
         st.session_state.company_models_error = str(exc)
 
 
-def ai_cases_by_turn() -> dict[int, list]:
-    cases_by_turn: dict[int, list] = {}
-    for case in st.session_state.bad_cases:
-        if case.source == "ai_judge" and case.turn_index >= 0:
+def is_auto_detected_bad_case(case: BadCase) -> bool:
+    return case.turn_index >= 0 and case.source != "human"
+
+
+def cases_by_turn(cases: list[BadCase]) -> dict[int, list[BadCase]]:
+    cases_by_turn: dict[int, list[BadCase]] = {}
+    for case in cases:
+        if is_auto_detected_bad_case(case):
             cases_by_turn.setdefault(case.turn_index, []).append(case)
     return cases_by_turn
+
+
+def current_cases_by_turn() -> dict[int, list[BadCase]]:
+    return cases_by_turn(st.session_state.bad_cases)
+
+
+def trace_version_conversation_view(trace_version: dict | None) -> str | None:
+    if trace_version is None:
+        return None
+    trace_view = trace_version.get("scan_conversation_view")
+    return trace_view if trace_view in ("Updated", "Original") else None
+
+
+def active_trace_conversation_view(trace_version: dict | None = None) -> str | None:
+    version_view = trace_version_conversation_view(trace_version)
+    if version_view:
+        return version_view
+    current_view = st.session_state.bad_cases_conversation_view
+    if st.session_state.bad_cases and current_view in ("Updated", "Original"):
+        return current_view
+    return None
+
+
+def active_trace_cases_by_turn(
+    conversation_view: str,
+    trace_version: dict | None = None,
+) -> dict[int, list[BadCase]]:
+    trace_view = active_trace_conversation_view(trace_version)
+    if trace_view != conversation_view:
+        return {}
+    if trace_version is not None:
+        return cases_by_turn(version_trace_cases(trace_version))
+    return current_cases_by_turn()
 
 
 def prompt_diff(before: str, after: str, from_label: str, to_label: str) -> str:
@@ -1158,6 +1229,21 @@ def set_apply_status_from_rerun(success_message: str) -> None:
     )
 
 
+def can_rerun_unchanged_prompt(
+    target_indices: set[int],
+    required_tools_by_turn: dict[int, str],
+) -> bool:
+    return bool(target_indices and required_tools_by_turn)
+
+
+def unchanged_prompt_rerun_summary(target_count: int) -> str:
+    turn_word = "turn" if target_count == 1 else "turns"
+    return (
+        "No new system-prompt version was needed; the existing prompt already contains the required "
+        f"tool rule, so this run only regenerated the target assistant {turn_word} with the current prompt."
+    )
+
+
 def prompt_fingerprint(prompt: str) -> str:
     return hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:10]
 
@@ -1384,6 +1470,22 @@ def apply_bad_case_to_prompt(
         )
         rerun_attempted = True
         set_apply_status_from_rerun("Applied and rerun.")
+    elif can_rerun_unchanged_prompt(target_indices, required_tools_by_turn):
+        rerun_only_summary = unchanged_prompt_rerun_summary(len(target_indices))
+        st.session_state.last_apply_summary = rerun_only_summary
+        push_toast("No new prompt version; rerunning target turn.", "info")
+        rerun_with_prompt(
+            data=data,
+            before_prompt=current_prompt,
+            optimized_prompt=current_prompt,
+            applied_feedback_summary=rerun_only_summary,
+            llm_settings=llm_settings,
+            target_assistant_turn_indices=target_indices,
+            required_tools_by_turn=required_tools_by_turn,
+            expected_prompt_version=before_version,
+        )
+        rerun_attempted = True
+        set_apply_status_from_rerun("Conversation rerun completed with the existing prompt.")
     else:
         set_apply_status(
             "Prompt edit failed; rerun skipped. The prompt was unchanged after retry, "
@@ -1484,6 +1586,22 @@ def apply_selected_bad_cases_to_prompt(
         )
         rerun_attempted = True
         set_apply_status_from_rerun("Applied and rerun.")
+    elif can_rerun_unchanged_prompt(target_indices, required_tools_by_turn):
+        rerun_only_summary = unchanged_prompt_rerun_summary(len(target_indices))
+        st.session_state.last_apply_summary = rerun_only_summary
+        push_toast("No new prompt version; rerunning selected target turn(s).", "info")
+        rerun_with_prompt(
+            data=data,
+            before_prompt=before_prompt,
+            optimized_prompt=before_prompt,
+            applied_feedback_summary=rerun_only_summary,
+            llm_settings=llm_settings,
+            target_assistant_turn_indices=target_indices,
+            required_tools_by_turn=required_tools_by_turn,
+            expected_prompt_version=before_version,
+        )
+        rerun_attempted = True
+        set_apply_status_from_rerun("Conversation rerun completed with the existing prompt.")
     else:
         set_apply_status(
             "Prompt edit failed; rerun skipped. The prompt was unchanged after retry, "
@@ -1682,7 +1800,7 @@ def render_bad_cases(
     if not st.session_state.bad_cases:
         st.info("No trace items yet.")
         return
-    ai_count = len([case for case in st.session_state.bad_cases if case.source == "ai_judge"])
+    ai_count = len([case for case in st.session_state.bad_cases if is_auto_detected_bad_case(case)])
     human_count = len([case for case in st.session_state.bad_cases if case.source == "human"])
     if st.session_state.bad_cases_conversation_view:
         prompt_label = st.session_state.trace_source_prompt_label or "current prompt"
@@ -1693,8 +1811,11 @@ def render_bad_cases(
     select_col, clear_col, apply_col = st.columns([0.28, 0.28, 0.44], gap="small")
     if select_col.button("Select all", use_container_width=True):
         select_all_bad_cases()
+        request_trace_scroll_restore()
     if clear_col.button("Clear", use_container_width=True):
         clear_bad_case_selection()
+        request_trace_scroll_restore()
+    render_trace_scroll_restore()
     selected_indices = selected_bad_case_indices()
     if apply_col.button(
         f"Apply selected ({len(selected_indices)})",
@@ -2028,24 +2149,21 @@ def main() -> None:
             st.rerun()
 
         clear_legacy_anchor_hash("trace-list")
+        st.markdown("<div id='trace-list-top'></div>", unsafe_allow_html=True)
         st.markdown("<div class='section-heading'>Trace List</div>", unsafe_allow_html=True)
+        trace_version = selected_trace_version()
         render_bad_cases(
             build_current_analysis_data(data, st.session_state.current_system_prompt_view),
             llm_settings,
             st.session_state.current_system_prompt_view,
-            trace_version=selected_trace_version(),
+            trace_version=trace_version,
         )
 
     with right_col:
         conversation_view = "Original"
         visible_interactions = data.interactions
         if st.session_state.rerun_interactions:
-            trace_view = (
-                st.session_state.bad_cases_conversation_view
-                if st.session_state.bad_cases
-                and st.session_state.bad_cases_conversation_view in ("Updated", "Original")
-                else None
-            )
+            trace_view = active_trace_conversation_view(trace_version)
             if trace_view:
                 st.session_state.conversation_view = trace_view
             if st.session_state.get("conversation_view") not in ("Updated", "Original"):
@@ -2071,11 +2189,7 @@ def main() -> None:
         st.subheader(f"{conversation_view} Conversation")
         if conversation_view == "Updated":
             st.caption("Showing assistant replies generated with the approved optimized prompt.")
-        turn_ai_cases = (
-            ai_cases_by_turn()
-            if conversation_view == st.session_state.bad_cases_conversation_view
-            else {}
-        )
+        turn_ai_cases = active_trace_cases_by_turn(conversation_view, trace_version)
         translation_map = render_translation_controls(
             visible_interactions,
             conversation_view,

@@ -1368,6 +1368,7 @@ def rerun_conversation(
     results: list[RerunTurn] = []
     replay_messages: list[dict[str, str]] = [{"role": "system", "content": optimized_prompt}]
     rerun_all = target_assistant_turn_indices is None
+    explicit_targeted_rerun = target_assistant_turn_indices is not None
     if target_assistant_turn_indices is None:
         target_assistant_turn_indices = {
             index for index, turn in enumerate(data.interactions) if turn.role == "assistant"
@@ -1387,14 +1388,20 @@ def rerun_conversation(
         ]
 
     pending_user: tuple[int, str] | None = None
+    latest_user: tuple[int, str] | None = None
     for index, turn in enumerate(data.interactions):
         if turn.role == "user":
             pending_user = (index, turn.content)
+            latest_user = pending_user
             replay_messages.append(_interaction_replay_message(turn))
             continue
 
-        if turn.role == "assistant" and pending_user is not None:
-            user_index, user_message = pending_user
+        if turn.role == "assistant" and (
+            pending_user is not None
+            or (explicit_targeted_rerun and index in target_assistant_turn_indices)
+        ):
+            has_immediate_user = pending_user is not None
+            user_index, user_message = pending_user or latest_user or (-1, "")
             if index not in target_assistant_turn_indices:
                 replay_messages.append(_interaction_replay_message(turn))
                 pending_user = None
@@ -1429,7 +1436,12 @@ def rerun_conversation(
                 )
                 response_diagnostics = _last_response_diagnostics(settings)
                 if required_tool and not _contains_required_tool_call(new_response, required_tool):
-                    new_response = _forced_required_tool_call(required_tool, user_message)
+                    forced_query_source = (
+                        user_message
+                        if has_immediate_user
+                        else _forced_tool_query_source(request_messages, user_message, turn.content)
+                    )
+                    new_response = _forced_required_tool_call(required_tool, forced_query_source)
                     response_diagnostics = {
                         **(response_diagnostics or {}),
                         "forced_required_tool_call": {
@@ -1594,6 +1606,24 @@ def _forced_required_tool_call(required_tool: str, user_message: str) -> str:
     return f"<function-call>{required_tool}:{json.dumps(arguments, ensure_ascii=False)}</function-call>"
 
 
+def _forced_tool_query_source(
+    request_messages: list[dict[str, str]],
+    fallback_user_message: str,
+    old_assistant_response: str,
+) -> str:
+    user_messages = [
+        str(message.get("content") or "")
+        for message in request_messages
+        if message.get("role") == "user" and str(message.get("content") or "").strip()
+    ]
+    pieces = user_messages[-3:]
+    if old_assistant_response.strip():
+        pieces.append(old_assistant_response)
+    if not pieces and fallback_user_message.strip():
+        pieces.append(fallback_user_message)
+    return " ".join(pieces)
+
+
 def _forced_tool_query(user_message: str) -> str:
     compacted = _compact_text(user_message)
     return compacted[:240] if compacted else ""
@@ -1655,7 +1685,9 @@ def generate_experiment_conclusion(
         "Each value must be one short paragraph. Do not include headings, bullets, numbered labels, or markdown lists. "
         "Keep all three paragraphs together under 180 words.\n\n"
         "paragraph_1 must summarize the exact previous prompt/rule change using paragraph_inputs.paragraph_1_changes. "
-        "Mention concrete changed rule text or duplicated/weak edit quality when present.\n\n"
+        "If paragraph_inputs.paragraph_1_changes.prompt_changed is false, state that no new system-prompt version "
+        "was made and that the target conversation turn was rerun with the existing prompt; do not describe that as "
+        "a failed or skipped experiment. Mention concrete changed rule text or duplicated/weak edit quality when present.\n\n"
         "paragraph_2 must evaluate whether the bad case was actually improved using "
         "paragraph_inputs.paragraph_2_improvement_evidence. Do not claim the response is identical when "
         "target_turn_comparisons says only wording changed; instead say wording changed but target behavior did or did "
@@ -1738,6 +1770,7 @@ def _build_conclusion_payload(
     post_rerun_scan_status: str,
 ) -> dict[str, object]:
     prompt_diff = _prompt_unified_diff(before_prompt, optimized_prompt)
+    prompt_changed = before_prompt.strip() != optimized_prompt.strip()
     rerun_evidence = [_rerun_evidence_item(result) for result in rerun_results]
     diagnostic_evidence = _experiment_diagnostic_evidence(
         data=data,
@@ -1767,11 +1800,14 @@ def _build_conclusion_payload(
         "paragraph_inputs": {
             "paragraph_1_changes": {
                 "applied_feedback_summary": applied_feedback_summary,
+                "prompt_changed": prompt_changed,
                 "prompt_diff": prompt_diff,
                 "prompt_change_quality": prompt_change_quality,
                 "instruction": (
-                    "State the exact changed rule. If the edit only repeats an abstract instruction "
-                    "or duplicates wording, say that clearly."
+                    "State the exact changed rule. If prompt_changed is false, state that no new "
+                    "system-prompt version was needed and the existing prompt was used for a conversation-only "
+                    "target rerun. If the edit only repeats an abstract instruction or duplicates wording, "
+                    "say that clearly."
                 ),
             },
             "paragraph_2_improvement_evidence": {

@@ -7,6 +7,7 @@ import html
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 import streamlit as st
@@ -43,7 +44,8 @@ load_dotenv()
 DEFAULT_COMPANY_URL = os.getenv("COMPANY_LLM_URL", "http://192.168.101.15:9898")
 DEFAULT_COMPANY_PROVIDER = os.getenv("COMPANY_LLM_PROVIDER", "openai_api_like")
 DEFAULT_COMPANY_MODEL = os.getenv("COMPANY_LLM_MODEL", "H200_01_fc_9010")
-APP_BUILD = "apply-context-v88"
+APP_BUILD = "round-history-v89"
+ROUND_HISTORY_LOG = Path(__file__).parent / "logs" / "optimization_rounds.jsonl"
 
 st.set_page_config(
     page_title="Prompt Optimizer Agent",
@@ -155,6 +157,8 @@ def init_state() -> None:
         "apply_status": None,
         "apply_status_level": "info",
         "apply_audit": [],
+        "round_history": [],
+        "latest_scan_round_id": None,
         "trace_source_prompt_label": None,
         "optimization": None,
         "original_system_prompt_view": "",
@@ -311,6 +315,8 @@ def parse_current_json(standardize_raw_text: bool = False) -> None:
         st.session_state.apply_status = None
         st.session_state.apply_status_level = "info"
         st.session_state.apply_audit = []
+        st.session_state.round_history = []
+        st.session_state.latest_scan_round_id = None
         st.session_state.trace_source_prompt_label = None
         st.session_state.optimization = None
         st.session_state.rerun_results = []
@@ -338,6 +344,8 @@ def parse_current_json(standardize_raw_text: bool = False) -> None:
     st.session_state.apply_status = None
     st.session_state.apply_status_level = "info"
     st.session_state.apply_audit = []
+    st.session_state.round_history = []
+    st.session_state.latest_scan_round_id = None
     st.session_state.trace_source_prompt_label = None
     st.session_state.optimization = None
     st.session_state.rerun_results = []
@@ -406,6 +414,8 @@ def clear_loaded_conversation() -> None:
     st.session_state.apply_status = None
     st.session_state.apply_status_level = "info"
     st.session_state.apply_audit = []
+    st.session_state.round_history = []
+    st.session_state.latest_scan_round_id = None
     st.session_state.trace_source_prompt_label = None
     st.session_state.optimization = None
     st.session_state.original_system_prompt_view = ""
@@ -519,6 +529,8 @@ def reset_analysis_state() -> None:
     st.session_state.apply_status = None
     st.session_state.apply_status_level = "info"
     st.session_state.apply_audit = []
+    st.session_state.round_history = []
+    st.session_state.latest_scan_round_id = None
     st.session_state.trace_source_prompt_label = None
     st.session_state.optimization = None
     st.session_state.rerun_results = []
@@ -797,30 +809,40 @@ def rerun_with_prompt(
         else:
             push_toast("Conclusion ready.", "success")
         return
+    judge_settings = judge_llm_settings(llm_settings, st.session_state.judge_backend)
     analyzed_cases = safe_analyze_bad_cases(
         data=updated_data,
         manual_feedback={},
-        llm_settings=judge_llm_settings(llm_settings, st.session_state.judge_backend),
+        llm_settings=judge_settings,
     )
-    judge_settings = judge_llm_settings(llm_settings, st.session_state.judge_backend)
     post_rerun_bad_cases, analysis_errors = split_analysis_results(analyzed_cases)
     if post_rerun_bad_cases:
-        set_analysis_status(
-            f"Updated analyzed. {len(post_rerun_bad_cases)} residual badcase(s).",
-            "warning",
-        )
+        status = "completed"
+        status_level = "warning"
+        status_message = f"Updated analyzed. {len(post_rerun_bad_cases)} residual badcase(s)."
     elif analysis_errors:
-        set_analysis_status(
-            format_analysis_error_status("Updated generated, but", analysis_errors),
-            "warning",
-        )
+        status = "failed"
+        status_level = "warning"
+        status_message = format_analysis_error_status("Updated generated, but", analysis_errors)
     elif judge_settings.backend == "openai" and not os.getenv("OPENAI_API_KEY"):
-        set_analysis_status(
-            "Updated ready. OpenAI judge key missing.",
-            "warning",
-        )
+        status = "skipped"
+        status_level = "warning"
+        status_message = "Updated ready. OpenAI judge key missing."
     else:
-        set_analysis_status("Updated analyzed. No badcases.", "success")
+        status = "completed"
+        status_level = "success"
+        status_message = "Updated analyzed. No badcases."
+    set_analysis_status(status_message, status_level)
+    record_scan_round(
+        post_rerun_bad_cases,
+        analysis_errors,
+        status=status,
+        status_message=status_message,
+        status_level=status_level,
+        judge_settings=judge_settings,
+        conversation_view="Updated",
+        trigger="auto_post_rerun_analysis",
+    )
     st.session_state.rerun_conclusion = generate_experiment_conclusion(
         data=original_data,
         before_prompt=before_prompt,
@@ -1028,6 +1050,148 @@ def bad_case_trace_id(case: BadCase) -> str:
     return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
 
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def conversation_fingerprint() -> str | None:
+    raw_text = st.session_state.get("raw_text") or ""
+    if not raw_text:
+        return None
+    return hashlib.sha1(str(raw_text).encode("utf-8")).hexdigest()[:10]
+
+
+def llm_settings_snapshot(settings: LLMSettings) -> dict[str, object]:
+    return {
+        "backend": settings.backend,
+        "provider": settings.provider,
+        "model": settings.model,
+        "base_url": settings.base_url,
+        "max_completion_tokens": settings.max_completion_tokens,
+    }
+
+
+def append_round_history_event(event: dict[str, object]) -> dict[str, object]:
+    history = list(st.session_state.get("round_history") or [])
+    event_type = str(event.get("type") or "event")
+    type_sequence = len([item for item in history if item.get("type") == event_type]) + 1
+    event = {
+        **event,
+        "event_id": f"{event_type}-{type_sequence:03d}",
+        "sequence": len(history) + 1,
+        "timestamp": utc_timestamp(),
+        "conversation_hash": conversation_fingerprint(),
+    }
+    history.append(event)
+    st.session_state.round_history = history
+    persist_round_history_event(event)
+    return event
+
+
+def persist_round_history_event(event: dict[str, object]) -> None:
+    try:
+        ROUND_HISTORY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with ROUND_HISTORY_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError as exc:
+        push_toast(f"Round history log write failed: {exc}", "warning")
+
+
+def record_scan_round(
+    cases: list[BadCase],
+    analysis_errors: list[BadCase],
+    *,
+    status: str,
+    status_message: str,
+    status_level: str,
+    judge_settings: LLMSettings,
+    conversation_view: str | None = None,
+    trigger: str = "manual_generate_badcase",
+) -> dict[str, object]:
+    prompt = st.session_state.current_system_prompt_view
+    prompt_label = current_prompt_version_label()
+    event = append_round_history_event(
+        {
+            "type": "scan",
+            "trigger": trigger,
+            "status": status,
+            "status_level": status_level,
+            "status_message": status_message,
+            "prompt_version_label": prompt_label,
+            "prompt_hash": prompt_fingerprint(prompt),
+            "prompt_len": len(prompt),
+            "conversation_view": conversation_view or st.session_state.bad_cases_conversation_view,
+            "badcase_count": len(cases),
+            "analysis_error_count": len(analysis_errors),
+            "badcases": prompt_version_trace_snapshot(cases, []),
+            "analysis_errors": prompt_version_trace_snapshot(analysis_errors, []),
+            "judge": llm_settings_snapshot(judge_settings),
+        }
+    )
+    st.session_state.latest_scan_round_id = event["event_id"]
+    return event
+
+
+def record_review_round(
+    decision: str,
+    cases: list[BadCase],
+    *,
+    reason: str,
+) -> None:
+    append_round_history_event(
+        {
+            "type": "review",
+            "decision": decision,
+            "reason": reason,
+            "parent_scan_round_id": st.session_state.get("latest_scan_round_id"),
+            "trace_count": len(cases),
+            "trace_ids": [bad_case_trace_id(case) for case in cases],
+            "badcases": prompt_version_trace_snapshot(cases, []),
+        }
+    )
+
+
+def record_apply_round(
+    *,
+    action: str,
+    cases: list[BadCase],
+    parent_scan_round_id: str | None,
+    before_prompt: str,
+    after_prompt: str,
+    before_version: str,
+    after_version: str,
+    rerun_attempted: bool,
+    rerun_target_turns: set[int],
+    prompt_edit_retries: int,
+) -> None:
+    append_round_history_event(
+        {
+            "type": "apply",
+            "action": action,
+            "human_decision": "approved",
+            "parent_scan_round_id": parent_scan_round_id,
+            "status": st.session_state.get("apply_status_level", "info"),
+            "status_message": st.session_state.get("apply_status"),
+            "summary": st.session_state.get("last_apply_summary"),
+            "diff": st.session_state.get("last_apply_diff"),
+            "approved_trace_count": len(cases),
+            "trace_ids": [bad_case_trace_id(case) for case in cases],
+            "case_turns": [case.turn_index for case in cases],
+            "badcases": prompt_version_trace_snapshot(cases, cases),
+            "before_version": before_version,
+            "after_version": after_version,
+            "prompt_changed": after_prompt != before_prompt,
+            "before_hash": prompt_fingerprint(before_prompt),
+            "after_hash": prompt_fingerprint(after_prompt),
+            "before_len": len(before_prompt),
+            "after_len": len(after_prompt),
+            "rerun_attempted": rerun_attempted,
+            "rerun_target_turns": sorted(rerun_target_turns),
+            "prompt_edit_retries": prompt_edit_retries,
+        }
+    )
+
+
 def record_current_version_scan_trace(cases: list[BadCase]) -> None:
     ensure_prompt_versions(st.session_state.current_system_prompt_view)
     label = current_prompt_version_label()
@@ -1097,25 +1261,30 @@ def run_generate_badcase_scan(data: ConversationData, llm_settings: LLMSettings)
     record_current_version_scan_trace(st.session_state.bad_cases)
     clear_bad_case_selection()
     if st.session_state.bad_cases:
-        set_analysis_status(
-            f"Scan complete. {len(st.session_state.bad_cases)} trace item(s).",
-            "success",
-        )
+        status = "completed"
+        status_level = "success"
+        status_message = f"Scan complete. {len(st.session_state.bad_cases)} trace item(s)."
     elif analysis_errors:
-        set_analysis_status(
-            format_analysis_error_status("Scan failed:", analysis_errors),
-            "error",
-        )
+        status = "failed"
+        status_level = "error"
+        status_message = format_analysis_error_status("Scan failed:", analysis_errors)
     elif judge_settings.backend == "openai" and not os.getenv("OPENAI_API_KEY"):
-        set_analysis_status(
-            "Scan skipped. OpenAI key missing.",
-            "warning",
-        )
+        status = "skipped"
+        status_level = "warning"
+        status_message = "Scan skipped. OpenAI key missing."
     else:
-        set_analysis_status(
-            "Scan complete. No trace items.",
-            "success",
-        )
+        status = "completed"
+        status_level = "success"
+        status_message = "Scan complete. No trace items."
+    set_analysis_status(status_message, status_level)
+    record_scan_round(
+        st.session_state.bad_cases,
+        analysis_errors,
+        status=status,
+        status_message=status_message,
+        status_level=status_level,
+        judge_settings=judge_settings,
+    )
     generate_post_scan_conclusion_if_needed(
         data=data,
         llm_settings=llm_settings,
@@ -1373,6 +1542,11 @@ def delete_bad_case(case_index: int) -> None:
     if not 0 <= case_index < len(st.session_state.bad_cases):
         return
     case = st.session_state.bad_cases[case_index]
+    record_review_round(
+        "rejected",
+        [case],
+        reason="Trace item deleted during human review.",
+    )
     if case.source == "human":
         st.session_state.manual_feedback.pop(case.turn_index, None)
         st.session_state[f"bad_case_{case.turn_index}"] = False
@@ -1418,6 +1592,7 @@ def apply_bad_case_to_prompt(
     if not 0 <= case_index < len(st.session_state.bad_cases):
         return
     case = st.session_state.bad_cases[case_index]
+    parent_scan_round_id = st.session_state.get("latest_scan_round_id")
     before_version = current_prompt_version_label()
     optimization = apply_recommendation_to_system_prompt(
         data=data,
@@ -1503,6 +1678,18 @@ def apply_bad_case_to_prompt(
         rerun_target_turns=target_indices,
         prompt_edit_retries=retry_count,
     )
+    record_apply_round(
+        action="Apply",
+        cases=[case],
+        parent_scan_round_id=parent_scan_round_id,
+        before_prompt=current_prompt,
+        after_prompt=optimization.optimized_prompt,
+        before_version=before_version,
+        after_version=current_prompt_version_label(),
+        rerun_attempted=rerun_attempted,
+        rerun_target_turns=target_indices,
+        prompt_edit_retries=retry_count,
+    )
 
 
 def apply_selected_bad_cases_to_prompt(
@@ -1520,6 +1707,7 @@ def apply_selected_bad_cases_to_prompt(
         st.session_state.bad_case_selection_error = "Select at least one bad case first."
         return
 
+    parent_scan_round_id = st.session_state.get("latest_scan_round_id")
     before_prompt = current_prompt
     before_version = current_prompt_version_label()
     working_prompt = current_prompt
@@ -1611,6 +1799,18 @@ def apply_selected_bad_cases_to_prompt(
     record_apply_audit(
         action="Apply selected",
         case_turns=[case.turn_index for case in selected_cases],
+        before_prompt=before_prompt,
+        after_prompt=working_prompt,
+        before_version=before_version,
+        after_version=current_prompt_version_label(),
+        rerun_attempted=rerun_attempted,
+        rerun_target_turns=target_indices,
+        prompt_edit_retries=retry_count,
+    )
+    record_apply_round(
+        action="Apply selected",
+        cases=selected_cases,
+        parent_scan_round_id=parent_scan_round_id,
         before_prompt=before_prompt,
         after_prompt=working_prompt,
         before_version=before_version,
@@ -1863,6 +2063,104 @@ def render_bad_cases(
                 st.markdown("**Recommendation**")
                 st.write(case.recommendation)
             st.markdown("<div class='trace-card-bottom-spacer'></div>", unsafe_allow_html=True)
+
+
+def round_history_event_title(event: dict[str, object]) -> str:
+    event_id = str(event.get("event_id") or "event")
+    event_type = str(event.get("type") or "event")
+    timestamp = str(event.get("timestamp") or "")[:19]
+    if event_type == "scan":
+        count = int(event.get("badcase_count") or 0)
+        status = str(event.get("status") or "unknown")
+        prompt_label = str(event.get("prompt_version_label") or "prompt")
+        return f"{event_id} - scan - {count} badcase(s) - {status} - {prompt_label} - {timestamp}"
+    if event_type == "apply":
+        count = int(event.get("approved_trace_count") or 0)
+        status = str(event.get("status") or "unknown")
+        before = str(event.get("before_version") or "?")
+        after = str(event.get("after_version") or "?")
+        return f"{event_id} - apply - {count} approved - {status} - {before} -> {after} - {timestamp}"
+    if event_type == "review":
+        decision = str(event.get("decision") or "reviewed")
+        count = int(event.get("trace_count") or 0)
+        return f"{event_id} - review - {decision} {count} trace(s) - {timestamp}"
+    return f"{event_id} - {event_type} - {timestamp}"
+
+
+def round_history_trace_rows(cases: list[dict[str, object]]) -> list[dict[str, object]]:
+    rows = []
+    for case in cases:
+        rows.append(
+            {
+                "id": case.get("id"),
+                "turn": case.get("turn_index"),
+                "type": case.get("error_type"),
+                "source": case.get("source"),
+                "applied": bool(case.get("applied")),
+            }
+        )
+    return rows
+
+
+def render_round_history() -> None:
+    st.markdown("<div class='section-heading'>Round History</div>", unsafe_allow_html=True)
+    history = st.session_state.get("round_history") or []
+    if not history:
+        st.info("No recorded rounds yet.")
+        return
+
+    st.caption(f"Persisted log: {ROUND_HISTORY_LOG.relative_to(Path(__file__).parent)}")
+    st.download_button(
+        "download round history",
+        data=json.dumps(history, ensure_ascii=False, indent=2),
+        file_name="round_history.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+    for event in reversed(history[-12:]):
+        with st.expander(round_history_event_title(event), expanded=False):
+            event_type = str(event.get("type") or "event")
+            if event_type == "scan":
+                metric_cols = st.columns(3)
+                metric_cols[0].metric("Badcases", int(event.get("badcase_count") or 0))
+                metric_cols[1].metric("Errors", int(event.get("analysis_error_count") or 0))
+                metric_cols[2].metric("Prompt hash", str(event.get("prompt_hash") or ""))
+                st.caption(
+                    f"View: {event.get('conversation_view') or 'unknown'} | "
+                    f"Trigger: {event.get('trigger') or 'unknown'} | "
+                    f"Prompt: {event.get('prompt_version_label') or 'unknown'}"
+                )
+                trace_rows = round_history_trace_rows(event.get("badcases") or [])
+                if trace_rows:
+                    st.dataframe(trace_rows, hide_index=True, use_container_width=True)
+                else:
+                    st.info("No badcases recorded for this scan.")
+                if event.get("analysis_errors"):
+                    st.markdown("**Analysis errors**")
+                    st.json(event.get("analysis_errors"))
+            elif event_type == "apply":
+                st.caption(
+                    f"Parent scan: {event.get('parent_scan_round_id') or 'none'} | "
+                    f"Prompt changed: {event.get('prompt_changed')} | "
+                    f"Rerun attempted: {event.get('rerun_attempted')}"
+                )
+                if event.get("summary"):
+                    st.write(event.get("summary"))
+                trace_rows = round_history_trace_rows(event.get("badcases") or [])
+                if trace_rows:
+                    st.dataframe(trace_rows, hide_index=True, use_container_width=True)
+                diff = str(event.get("diff") or "")
+                if diff:
+                    st.code(diff, language="diff")
+            elif event_type == "review":
+                st.caption(f"Parent scan: {event.get('parent_scan_round_id') or 'none'}")
+                if event.get("reason"):
+                    st.write(event.get("reason"))
+                trace_rows = round_history_trace_rows(event.get("badcases") or [])
+                if trace_rows:
+                    st.dataframe(trace_rows, hide_index=True, use_container_width=True)
+            else:
+                st.json(event)
 
 
 def render_version_trace_list(version: dict) -> None:
@@ -2158,6 +2456,7 @@ def main() -> None:
             st.session_state.current_system_prompt_view,
             trace_version=trace_version,
         )
+        render_round_history()
 
     with right_col:
         conversation_view = "Original"

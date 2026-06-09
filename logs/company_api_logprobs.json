@@ -1,14 +1,14 @@
 {
   "logprobs": {
-    "requested": true,
-    "top_logprobs_requested": 5,
+    "requested": false,
+    "top_logprobs_requested": null,
     "retry_without_logprobs": false,
     "available": false,
-    "reason": "Company API response did not include choices[0].logprobs."
+    "reason": "Logprobs were not requested for this request purpose."
   },
-  "request_id": "468a338fc3",
-  "timestamp": "2026-06-08T07:39:46.519423+00:00",
-  "purpose": "targeted_rerun",
+  "request_id": "4718743fcf",
+  "timestamp": "2026-06-09T08:21:58.725130+00:00",
+  "purpose": "prompt_edit_json_patch_retry",
   "provider": "openai_api_like",
   "model": "H200_01_fc_9010",
   "endpoint": "http://192.168.101.15:9898/v1/chat/completions"

@@ -1,6 +1,6 @@
 ---
 name: prompt-compliance-optimizer
-description: Use only when the user explicitly asks Codex to operate, debug, or explain the Prompt Optimizer Agent workflow, inspect system-prompt compliance badcases, apply prompt fixes, rerun target conversation turns, analyze Trace List or Conclusion behavior, or troubleshoot the prompt_optimizer_agent app.
+description: Use only when the user explicitly asks Codex to operate, debug, or explain the Prompt Optimizer Agent workflow, inspect system-prompt compliance badcases, apply prompt fixes, rerun target conversation turns, run batch scan/apply workflows, analyze Trace List or Conclusion behavior, or troubleshoot the prompt_optimizer_agent app.
 ---
 
 # Prompt Compliance Optimizer
@@ -11,13 +11,7 @@ Use the existing Prompt Optimizer Agent app/model as the execution surface. This
 
 For examples of how to invoke this skill, see [TRIGGERING.md](TRIGGERING.md).
 
-Default repo path:
-
-```bash
-/Users/zlshlt2501003/Desktop/prompt_optimizer_agent
-```
-
-If this repository was cloned to another machine, use the clone path as the repo path.
+Default repo path: use the current repository root. If the skill is installed outside the project, first locate the repo that contains `app.py`, `prompt_optimizer_agent/`, `tools/`, and `logs/`.
 
 Start the UI only when needed:
 
@@ -43,6 +37,7 @@ streamlit run app.py
 - Do not rewrite a prompt just because an answer could be better; require an explicit violated rule, workflow step, branch condition, tool rule, or fact constraint.
 - If a trace requires a tool call and the current prompt already contains the rule, rerun the target conversation turn with the existing prompt instead of forcing a new prompt version.
 - For missing required-tool-call traces, infer the exact tool from the current file's system prompt and tool definitions; the target assistant turn should call that tool before factual answers. Do not hardcode dataset-specific tool names.
+- Do not treat exact-message escalation as a tool-call-only fix. If the violated rule requires exact spoken text, hotline wording, or a configured escalation message, the updated assistant turn must contain that required text and any required tool/action.
 - If rerun creates a function call, expect a placeholder `Tool` turn with `status: not_executed`; the app does not execute real tools locally.
 - If the prompt changed, expect a new prompt version and a diff. If the prompt did not change but rerun succeeded, describe it as a conversation-only rerun, not as a failed prompt edit.
 
@@ -76,9 +71,19 @@ Batch apply workflow:
 
 Batch apply constraints:
 
-- Batch auto-apply supports conversation-only rerun only for missing-required-tool-call cases where the required tool can be inferred from the current file's tool definitions.
-- Unsupported approved case types, or cases whose required tool cannot be inferred, must be reported as unsupported and left for individual review; do not pretend they were fixed.
-- The batch conclusion is mandatory and must include aggregate counts, per-file round ids, unsupported cases, residual badcase counts, and next action.
+- Batch apply must route approved cases before applying:
+  - `missing-required-tool-call`: use deterministic conversation-only required-tool replacement only when the required tool can be inferred from the current file's tool definitions and no exact spoken message is required.
+  - `prompt-flow violation`: use LLM prompt edit, then targeted rerun of the affected assistant turn(s), then residual scan.
+  - `exact-message escalation`: do not use function-call-only replacement. The fix must produce the required spoken text and any required tool/action; otherwise report the case as unsupported or backend-failed.
+- Unsupported approved case types, cases whose required tool cannot be inferred, or prompt edits where the backend fails to produce an applicable in-place patch/full prompt must be reported as unsupported; do not pretend they were fixed.
+- Treat residual scan as the source of truth. If changes were applied but residual badcases remain, say "applied changes" instead of "fixed".
+- The batch conclusion is mandatory and must include aggregate counts, per-file round ids, apply mode, backend/model for prompt edits, unsupported cases, residual badcase counts, and next action.
+
+Company model selection:
+
+- Default to the configured H200 company model; do not ask the user to choose a model unless they request it or the default model fails.
+- When the user wants alternatives, run `tools/batch_prompt_compliance.py apply --list-models --model-contains <keyword>` to show rough matches.
+- If applying with a rough match, use `--model-contains <keyword>` only when it matches exactly one company model. If multiple models match, show the candidate list and stop for user selection.
 
 ## Round History Rules
 

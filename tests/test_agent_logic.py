@@ -763,6 +763,108 @@ def test_prompt_edit_falls_back_to_full_prompt_when_patch_cannot_apply() -> None
         agent_logic._chat_json = old_chat_json
 
 
+def test_company_chat_json_retries_non_json_response() -> None:
+    old_chat_text = agent_logic._chat_text
+    calls = []
+
+    def fake_chat_text(**kwargs):
+        calls.append(kwargs["purpose"])
+        if kwargs["purpose"] == "prompt_edit":
+            return "I updated the prompt, but forgot JSON."
+        assert kwargs["purpose"] == "prompt_edit_json_retry"
+        return json.dumps(
+            {
+                "optimized_prompt": "Step 1: Greet.\nStep 2: Close.",
+                "rationale": "Retry returned valid JSON.",
+                "applied_feedback_summary": "Updated Step 2.",
+            }
+        )
+
+    agent_logic._chat_text = fake_chat_text
+    try:
+        content = agent_logic._chat_json(
+            settings=LLMSettings(
+                backend="company_api",
+                model="m",
+                provider="p",
+                base_url="http://example.test",
+            ),
+            messages=[
+                {"role": "system", "content": "Return JSON only with key optimized_prompt."},
+                {"role": "user", "content": "{}"},
+            ],
+            purpose="prompt_edit",
+        )
+    finally:
+        agent_logic._chat_text = old_chat_text
+
+    parsed = json.loads(content)
+    assert parsed["optimized_prompt"].endswith("Close.")
+    assert calls == ["prompt_edit", "prompt_edit_json_retry"]
+
+
+def test_extract_json_object_escapes_raw_newlines_inside_strings() -> None:
+    content = '{"optimized_prompt": "Step 1: Greet.\nStep 2: Close.", "rationale": "ok"}'
+
+    extracted = agent_logic._extract_json_object(content)
+
+    parsed = json.loads(extracted)
+    assert parsed["optimized_prompt"] == "Step 1: Greet.\nStep 2: Close."
+
+
+def test_prompt_edit_retries_as_patch_when_full_json_is_malformed() -> None:
+    old_chat_json = agent_logic._chat_json
+    calls = []
+
+    def fake_chat_json(settings, messages, purpose="json"):
+        calls.append(purpose)
+        if purpose == "prompt_edit_patch":
+            return json.dumps({"replace": {"old": "missing text", "new": "replacement"}})
+        if purpose == "prompt_edit":
+            return '{"optimized_prompt": "Step 1: Greet.\nStep 2: Ask for account name.'
+        if purpose == "prompt_edit_json_patch_retry":
+            return json.dumps(
+                {
+                    "replace": {
+                        "old": "Step 2: Ask for a phone number.",
+                        "new": "Step 2: Ask for a phone number or account name.",
+                    },
+                    "rationale": "Retried as small patch.",
+                    "applied_feedback_summary": "Patched Step 2.",
+                }
+            )
+        raise AssertionError(f"unexpected purpose {purpose}")
+
+    agent_logic._chat_json = fake_chat_json
+    try:
+        data = ConversationData(
+            system_prompt="Step 1: Greet.\nStep 2: Ask for a phone number.",
+            interactions=[Interaction(role="assistant", content="bad")],
+        )
+        result = apply_recommendation_to_system_prompt(
+            data=data,
+            current_system_prompt=data.system_prompt,
+            bad_case=BadCase(
+                turn_index=0,
+                role="assistant",
+                error_type="missing_alternative",
+                evidence="Only asks for phone.",
+                recommendation="Allow account name as fallback.",
+            ),
+            llm_settings=LLMSettings(
+                backend="company_api",
+                model="m",
+                provider="p",
+                base_url="http://example.test",
+            ),
+        )
+    finally:
+        agent_logic._chat_json = old_chat_json
+
+    assert result.optimized_prompt == "Step 1: Greet.\nStep 2: Ask for a phone number or account name."
+    assert calls == ["prompt_edit_patch", "prompt_edit", "prompt_edit_json_patch_retry"]
+
+
 def test_prompt_edit_retries_overlong_branch_paragraph() -> None:
     old_chat_json = agent_logic._chat_json
     calls = []

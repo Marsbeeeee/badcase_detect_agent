@@ -22,7 +22,10 @@ from prompt_optimizer_agent.agent_logic import (  # noqa: E402
     LLMSettings,
     _local_prompt_rule_bad_cases,
     analyze_bad_cases,
+    apply_recommendation_to_system_prompt,
+    rerun_conversation,
 )
+from prompt_optimizer_agent.company_demo_client import list_company_models  # noqa: E402
 from prompt_optimizer_agent.json_utils import (  # noqa: E402
     ConversationData,
     Interaction,
@@ -72,13 +75,25 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--batch-id", default=None)
 
     apply = subparsers.add_parser("apply", help="Apply approved cases from a batch review file.")
-    apply.add_argument("review_json", help="Path to batch_review.json produced by scan.")
+    apply.add_argument("review_json", nargs="?", help="Path to batch_review.json produced by scan.")
     apply.add_argument("--approve-all", action="store_true", help="Apply every case in the review file.")
     apply.add_argument(
         "--approval-file",
         default=None,
         help="JSON approval file. Accepts a list of case ids or {'approved_case_ids': [...]}",
     )
+    apply.add_argument(
+        "--apply-backend",
+        choices=["company", "openai"],
+        default="company",
+        help="Backend used for non-tool-call prompt edits and targeted reruns. Default: company",
+    )
+    apply.add_argument("--url", default=None, help="Company API base URL for non-tool-call apply.")
+    apply.add_argument("--provider", default=None, help="Company API provider for non-tool-call apply.")
+    apply.add_argument("--model", default=None, help="Model for non-tool-call apply.")
+    apply.add_argument("--model-contains", default=None, help="Select a company model by case-insensitive substring.")
+    apply.add_argument("--list-models", action="store_true", help="List company models, optionally filtered by --model-contains, then exit.")
+    apply.add_argument("--max-completion-tokens", type=int, default=4096)
     apply.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR / "applied"))
     apply.add_argument("--log", default=str(DEFAULT_ROUND_LOG))
     apply.add_argument("--batch-id", default=None)
@@ -136,6 +151,13 @@ def run_scan(args: argparse.Namespace) -> int:
 
 
 def run_apply(args: argparse.Namespace) -> int:
+    if args.list_models:
+        print_company_model_candidates(args)
+        return 0
+
+    if not args.review_json:
+        raise SystemExit("review_json is required unless --list-models is used.")
+
     review_path = Path(args.review_json).expanduser()
     review = json.loads(review_path.read_text(encoding="utf-8"))
     batch_id = args.batch_id or f"{review.get('batch_id', 'batch')}-apply"
@@ -147,7 +169,7 @@ def run_apply(args: argparse.Namespace) -> int:
 
     file_results = []
     for index, file_record in enumerate(review.get("files") or [], start=1):
-        result = apply_file_record(file_record, approved_ids, output_dir)
+        result = apply_file_record(file_record, approved_ids, output_dir, args)
         result["apply_event_id"] = f"{batch_id}-apply-{index:04d}"
         result["residual_scan_event_id"] = f"{batch_id}-residual-scan-{index:04d}"
         file_results.append(result)
@@ -258,7 +280,12 @@ def scan_file(path: Path, *, judge: str, settings: LLMSettings) -> dict[str, Any
     return base
 
 
-def apply_file_record(file_record: dict[str, Any], approved_ids: set[str], output_dir: Path) -> dict[str, Any]:
+def apply_file_record(
+    file_record: dict[str, Any],
+    approved_ids: set[str],
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
     source = Path(str(file_record["path"]))
     raw = source.read_text(encoding="utf-8")
     parsed = parse_conversation_json(raw)
@@ -274,29 +301,28 @@ def apply_file_record(file_record: dict[str, Any], approved_ids: set[str], outpu
         return apply_result_base(file_record, "no_approved_cases", [], [], [], None)
 
     data = parsed.data
-    replacements: dict[int, Interaction] = {}
-    applied_case_records: list[dict[str, Any]] = []
-    unsupported_cases = []
+    tool_cases = []
+    prompt_cases = []
     for case in approved_cases:
         required_tool = required_tool_for_case(data, case)
-        if not required_tool:
-            unsupported_cases.append(
-                {
-                    **case,
-                    "reason": (
-                        "Batch auto-apply only supports missing-required-tool-call cases when the "
-                        "required tool can be inferred from this file's tool definitions."
-                    ),
-                }
-            )
-            continue
-        target_turn = int(case["turn_index"])
-        query = query_for_case(data, case, target_turn)
-        replacements[target_turn] = required_tool_interaction(target_turn, required_tool, query)
-        applied_case_records.append({**case, "applied": True, "required_tool": required_tool})
+        if required_tool:
+            tool_cases.append((case, required_tool))
+        else:
+            prompt_cases.append(case)
 
-    updated_interactions = replace_interactions_with_placeholders(data.interactions, replacements)
-    updated_data = data.model_copy(update={"interactions": updated_interactions})
+    if prompt_cases:
+        updated_data, applied_case_records, unsupported_cases, apply_meta = apply_prompt_cases_with_llm(
+            data=data,
+            prompt_cases=prompt_cases,
+            tool_cases=tool_cases,
+            args=args,
+        )
+    else:
+        updated_data, applied_case_records, unsupported_cases, apply_meta = apply_required_tool_cases(
+            data=data,
+            tool_cases=tool_cases,
+        )
+
     residual_cases = [
         bad_case_record(case)
         for case in _local_prompt_rule_bad_cases(updated_data)
@@ -319,11 +345,11 @@ def apply_file_record(file_record: dict[str, Any], approved_ids: set[str], outpu
     result.update(
         {
             "updated_file": str(output_path),
-            "prompt_changed": False,
+            "prompt_changed": updated_data.system_prompt != data.system_prompt,
             "before_hash": sha1_text(data.system_prompt),
-            "after_hash": sha1_text(data.system_prompt),
+            "after_hash": sha1_text(updated_data.system_prompt),
             "before_version": "external Original",
-            "after_version": "external Original",
+            "after_version": "batch Apply" if updated_data.system_prompt != data.system_prompt else "external Original",
             "residual_badcase_count": len(residual_cases),
             "residual_badcases": residual_cases,
             "required_tools": sorted(
@@ -333,9 +359,145 @@ def apply_file_record(file_record: dict[str, Any], approved_ids: set[str], outpu
                     if case.get("required_tool")
                 }
             ),
+            **apply_meta,
         }
     )
     return result
+
+
+def apply_required_tool_cases(
+    *,
+    data: ConversationData,
+    tool_cases: list[tuple[dict[str, Any], str]],
+) -> tuple[ConversationData, list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    replacements: dict[int, Interaction] = {}
+    applied_case_records: list[dict[str, Any]] = []
+    for case, required_tool in tool_cases:
+        target_turn = int(case["turn_index"])
+        query = query_for_case(data, case, target_turn)
+        replacements[target_turn] = required_tool_interaction(target_turn, required_tool, query)
+        applied_case_records.append(
+            {
+                **case,
+                "applied": True,
+                "fix_type": "conversation_only_required_tool",
+                "required_tool": required_tool,
+            }
+        )
+    updated_interactions = replace_interactions_with_placeholders(data.interactions, replacements)
+    return (
+        data.model_copy(update={"interactions": updated_interactions}),
+        applied_case_records,
+        [],
+        {
+            "apply_mode": "required_tool_replacement",
+            "rerun_attempted": False,
+            "rerun_target_turns": sorted(replacements),
+            "rerun_errors": [],
+            "prompt_edit_summaries": [],
+        },
+    )
+
+
+def apply_prompt_cases_with_llm(
+    *,
+    data: ConversationData,
+    prompt_cases: list[dict[str, Any]],
+    tool_cases: list[tuple[dict[str, Any], str]],
+    args: argparse.Namespace,
+) -> tuple[ConversationData, list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    settings = build_apply_settings(args, data)
+    working_prompt = data.system_prompt
+    applied_case_records: list[dict[str, Any]] = []
+    unsupported_cases: list[dict[str, Any]] = []
+    prompt_edit_summaries: list[dict[str, str]] = []
+
+    for case in prompt_cases:
+        bad_case = bad_case_from_record(case)
+        optimization = apply_recommendation_to_system_prompt(
+            data=data.model_copy(update={"system_prompt": working_prompt}),
+            current_system_prompt=working_prompt,
+            bad_case=bad_case,
+            llm_settings=settings,
+        )
+        prompt_edit_summaries.append(
+            {
+                "case_id": str(case.get("id") or ""),
+                "rationale": optimization.rationale,
+                "applied_feedback_summary": optimization.applied_feedback_summary,
+                "prompt_changed": str(optimization.optimized_prompt != working_prompt),
+            }
+        )
+        if optimization.optimized_prompt == working_prompt:
+            unsupported_cases.append(
+                {
+                    **case,
+                    "reason": (
+                        "Prompt-edit backend returned no in-place prompt change for this "
+                        "non-tool-call case."
+                    ),
+                    "rationale": optimization.rationale,
+                }
+            )
+            continue
+        working_prompt = optimization.optimized_prompt
+        applied_case_records.append(
+            {
+                **case,
+                "applied": True,
+                "fix_type": "prompt_edit_targeted_rerun",
+                "applied_feedback_summary": optimization.applied_feedback_summary,
+            }
+        )
+
+    prompt_changed = working_prompt != data.system_prompt
+    required_tools_by_turn = required_tools_for_case_records(data, tool_cases)
+    target_turns = rerun_targets_for_case_records(data, [*prompt_cases, *[case for case, _ in tool_cases]])
+    rerun_results = []
+    rerun_errors: list[str] = []
+    updated_interactions = data.interactions
+    if prompt_changed or required_tools_by_turn:
+        rerun_results = rerun_conversation(
+            data=data.model_copy(update={"system_prompt": working_prompt}),
+            optimized_prompt=working_prompt,
+            llm_settings=settings,
+            target_assistant_turn_indices=target_turns,
+            required_tools_by_turn=required_tools_by_turn,
+        )
+        rerun_errors = [result.error for result in rerun_results if result.error]
+        updated_interactions = build_rerun_interactions(data, rerun_results)
+        for case, required_tool in tool_cases:
+            applied_case_records.append(
+                {
+                    **case,
+                    "applied": True,
+                    "fix_type": "llm_rerun_required_tool",
+                    "required_tool": required_tool,
+                }
+            )
+
+    updated_data = data.model_copy(
+        update={
+            "system_prompt": working_prompt,
+            "interactions": updated_interactions,
+        }
+    )
+    return (
+        updated_data,
+        applied_case_records,
+        unsupported_cases,
+        {
+            "apply_mode": "llm_prompt_edit_targeted_rerun",
+            "apply_backend": settings.backend,
+            "apply_model": settings.model,
+            "apply_provider": settings.provider,
+            "rerun_attempted": bool(rerun_results),
+            "rerun_target_turns": sorted(target_turns),
+            "rerun_errors": rerun_errors,
+            "rerun_results": [result.__dict__ for result in rerun_results],
+            "prompt_edit_summaries": prompt_edit_summaries,
+        },
+    )
 
 
 def apply_result_base(
@@ -381,6 +543,166 @@ def load_approved_ids(args: argparse.Namespace, review: dict[str, Any]) -> set[s
     raise SystemExit("Approval file must be a list or {'approved_case_ids': [...]}.")
 
 
+def build_apply_settings(args: argparse.Namespace, data: ConversationData) -> LLMSettings:
+    model_info = {}
+    if isinstance(data.source_meta, dict) and isinstance(data.source_meta.get("model_info"), dict):
+        model_info = data.source_meta["model_info"]
+    if args.apply_backend == "openai":
+        return LLMSettings(
+            backend="openai",
+            model=args.model or os.getenv("PROMPT_OPTIMIZER_MODEL", "gpt-4o-mini"),
+            max_completion_tokens=args.max_completion_tokens,
+        )
+    base_url = args.url or str(model_info.get("url") or DEFAULT_COMPANY_URL)
+    provider, model = resolve_company_model_selection(
+        url=base_url,
+        fallback_provider=args.provider or str(model_info.get("provider") or DEFAULT_COMPANY_PROVIDER),
+        fallback_model=args.model or str(model_info.get("model") or DEFAULT_COMPANY_MODEL),
+        model_contains=args.model_contains,
+    )
+    return LLMSettings(
+        backend="company_api",
+        base_url=base_url,
+        provider=provider,
+        model=model,
+        max_completion_tokens=args.max_completion_tokens,
+    )
+
+
+def print_company_model_candidates(args: argparse.Namespace) -> None:
+    url = args.url or DEFAULT_COMPANY_URL
+    models = list_company_models(url)
+    filtered = filter_company_models(models, args.model_contains)
+    print(
+        json.dumps(
+            {
+                "url": url,
+                "filter": args.model_contains,
+                "count": len(filtered),
+                "models": filtered,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def resolve_company_model_selection(
+    *,
+    url: str,
+    fallback_provider: str,
+    fallback_model: str,
+    model_contains: str | None,
+) -> tuple[str, str]:
+    if not model_contains:
+        return split_company_model(fallback_model, fallback_provider)
+
+    matches = filter_company_models(list_company_models(url), model_contains)
+    if len(matches) != 1:
+        print(
+            json.dumps(
+                {
+                    "error": "model_contains must match exactly one company model",
+                    "filter": model_contains,
+                    "count": len(matches),
+                    "models": matches,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return split_company_model(matches[0], fallback_provider)
+
+
+def filter_company_models(models: list[str], model_contains: str | None) -> list[str]:
+    if not model_contains:
+        return models
+    needle = model_contains.lower()
+    return [model for model in models if needle in model.lower()]
+
+
+def split_company_model(selection: str, fallback_provider: str) -> tuple[str, str]:
+    if ":" in selection:
+        provider, model = selection.split(":", 1)
+        return provider.strip(), model.strip()
+    return fallback_provider, selection.strip()
+
+
+def bad_case_from_record(case: dict[str, Any]) -> BadCase:
+    return BadCase(
+        turn_index=int(case.get("turn_index", -1)),
+        role=str(case.get("role") or "assistant"),
+        error_type=str(case.get("error_type") or "unknown"),
+        evidence=str(case.get("evidence") or ""),
+        recommendation=str(case.get("recommendation") or ""),
+        source=str(case.get("source") or "batch_review"),
+    )
+
+
+def rerun_targets_for_case_records(data: ConversationData, cases: list[dict[str, Any]]) -> set[int]:
+    targets: set[int] = set()
+    for case in cases:
+        try:
+            turn_index = int(case.get("turn_index"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= turn_index < len(data.interactions):
+            if data.interactions[turn_index].role == "assistant":
+                targets.add(turn_index)
+                continue
+            for index in range(turn_index + 1, len(data.interactions)):
+                if data.interactions[index].role == "assistant":
+                    targets.add(index)
+                    break
+    return targets
+
+
+def required_tools_for_case_records(
+    data: ConversationData,
+    tool_cases: list[tuple[dict[str, Any], str]],
+) -> dict[int, str]:
+    required: dict[int, str] = {}
+    for case, required_tool in tool_cases:
+        for target_index in rerun_targets_for_case_records(data, [case]):
+            required[target_index] = required_tool
+    return required
+
+
+def build_rerun_interactions(data: ConversationData, rerun_results: list[Any]) -> list[Interaction]:
+    replacements = {
+        result.assistant_turn_index: result
+        for result in rerun_results
+        if result.error is None
+        and result.assistant_turn_index is not None
+        and result.new_assistant_response
+    }
+    rebuilt: list[Interaction] = []
+    for index, turn in enumerate(data.interactions):
+        result = replacements.get(index)
+        if result is None:
+            rebuilt.append(turn)
+            continue
+        new_response = result.new_assistant_response
+        tool_calls = function_call_wrappers_to_tool_calls(
+            new_response,
+            id_prefix=f"call_batch_rerun_{index}",
+        )
+        rebuilt.append(
+            turn.model_copy(
+                update={
+                    "content": new_response,
+                    "tool_calls": tool_calls or None,
+                    "tool_call_id": None,
+                }
+            )
+        )
+        for call in tool_calls:
+            rebuilt.append(rerun_tool_placeholder_interaction(call))
+    return rebuilt
+
+
 def query_for_case(data: ConversationData, case: dict[str, Any], target_turn: int) -> str:
     evidence = str(case.get("evidence") or "")
     match = re.search(r"User turn\s+(\d+)", evidence)
@@ -399,6 +721,8 @@ def compact_query(text: str) -> str:
 
 
 def required_tool_for_case(data: ConversationData, case: dict[str, Any]) -> str | None:
+    if case_requires_exact_spoken_message(case):
+        return None
     if not case_is_missing_required_tool_call(case):
         return None
     tool_names = available_tool_names(data.tools)
@@ -444,6 +768,32 @@ def case_is_missing_required_tool_call(case: dict[str, Any]) -> bool:
         )
     )
     return missing_signal and tool_signal
+
+
+def case_requires_exact_spoken_message(case: dict[str, Any]) -> bool:
+    lowered = case_text(case).lower()
+    if "exact" not in lowered:
+        return False
+    if str(case.get("error_type") or "").lower() == "escalation_action_not_followed":
+        return any(
+            phrase in lowered
+            for phrase in (
+                "spoken text",
+                "deliver the following message exactly",
+                "required message",
+                "exact configured escalation action",
+                "hotline ending",
+            )
+        )
+    return any(
+        phrase in lowered
+        for phrase in (
+            "spoken text",
+            "exact message",
+            "message exactly",
+            "required wording",
+        )
+    )
 
 
 def available_tool_names(tools: dict[str, Any] | None) -> list[str]:
@@ -629,13 +979,20 @@ def apply_round_event(result: dict[str, Any]) -> dict[str, Any]:
         "badcases": result.get("applied_cases", []),
         "unsupported_cases": result.get("unsupported_cases", []),
         "required_tools": result.get("required_tools", []),
+        "apply_mode": result.get("apply_mode"),
+        "apply_backend": result.get("apply_backend"),
+        "apply_model": result.get("apply_model"),
+        "rerun_attempted": result.get("rerun_attempted", False),
+        "rerun_target_turns": result.get("rerun_target_turns", []),
+        "rerun_errors": result.get("rerun_errors", []),
+        "prompt_edit_summaries": result.get("prompt_edit_summaries", []),
         "prompt_changed": result.get("prompt_changed", False),
         "before_hash": result.get("before_hash"),
         "after_hash": result.get("after_hash"),
         "before_version": result.get("before_version"),
         "after_version": result.get("after_version"),
         "status": result.get("status"),
-        "status_message": "Batch conversation-only apply completed.",
+        "status_message": batch_apply_status_message(result),
     }
 
 
@@ -717,16 +1074,13 @@ def render_review_markdown(review: dict[str, Any]) -> str:
 
 
 def render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
+    fix_summary = batch_fix_summary(conclusion)
     lines = [
         f"# Batch Apply Conclusion: {conclusion['batch_id']}",
         "",
         "## Conclusion",
         "",
-        (
-            f"Fixed {conclusion['applied_case_count']} approved badcase(s) across "
-            f"{conclusion['file_count']} file(s). The fix was conversation-only rerun for supported "
-            "missing-required-tool-call cases. No new prompt version was created."
-        ),
+        fix_summary,
         "",
         "## Verification",
         "",
@@ -745,6 +1099,10 @@ def render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
                 f"  - status: `{item.get('status')}`",
                 f"  - updated_file: `{item.get('updated_file')}`",
                 f"  - scan/apply/residual: `{item.get('scan_event_id')}` / `{item.get('apply_event_id')}` / `{item.get('residual_scan_event_id')}`",
+                f"  - apply_mode: `{item.get('apply_mode') or 'none'}`",
+                f"  - prompt_changed: `{item.get('prompt_changed', False)}`",
+                f"  - rerun_target_turns: {', '.join(str(turn) for turn in item.get('rerun_target_turns') or []) or 'none'}",
+                f"  - rerun_errors: {len(item.get('rerun_errors') or [])}",
                 f"  - required_tools: {', '.join(item.get('required_tools') or []) or 'none'}",
                 f"  - applied: {item.get('applied_case_count', 0)}, residual: {item.get('residual_badcase_count', 0)}, unsupported: {len(item.get('unsupported_cases') or [])}",
             ]
@@ -763,6 +1121,37 @@ def render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def batch_apply_status_message(result: dict[str, Any]) -> str:
+    if not result.get("applied_case_count"):
+        return "Batch apply completed with no supported case changes."
+    if result.get("apply_mode") == "llm_prompt_edit_targeted_rerun":
+        if result.get("rerun_errors"):
+            return "Batch prompt edit completed, but one or more targeted reruns failed."
+        return "Batch prompt edit and targeted rerun completed."
+    if result.get("apply_mode") == "required_tool_replacement":
+        return "Batch conversation-only required-tool replacement completed."
+    return "Batch apply completed with no supported case changes."
+
+
+def batch_fix_summary(conclusion: dict[str, Any]) -> str:
+    file_items = conclusion.get("files") or []
+    prompt_changed = any(item.get("prompt_changed") for item in file_items)
+    modes = sorted({str(item.get("apply_mode") or "none") for item in file_items})
+    mode_text = ", ".join(modes)
+    prompt_text = "A new prompt version was created." if prompt_changed else "No new prompt version was created."
+    if conclusion["residual_badcase_count"] == 0:
+        result_text = f"Fixed {conclusion['applied_case_count']} approved badcase(s)"
+    else:
+        result_text = (
+            f"Applied changes for {conclusion['applied_case_count']} approved badcase(s); "
+            f"{conclusion['residual_badcase_count']} badcase(s) remain after residual scan"
+        )
+    return (
+        f"{result_text} across "
+        f"{conclusion['file_count']} file(s). Apply mode: {mode_text}. {prompt_text}"
+    )
 
 
 def new_batch_id(prefix: str) -> str:

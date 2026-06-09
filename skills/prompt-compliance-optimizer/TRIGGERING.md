@@ -31,7 +31,7 @@ $prompt-compliance-optimizer 检查这次 Apply / rerun / Conclusion 为什么�
 ```
 
 ```text
-这个 prompt optimizer agent 的 Updated Conversation 没更新，按那个 skill 的流程排查一下
+这个 Prompt Optimizer Agent 的 Updated Conversation 没更新，按那个 skill 的流程排查一下
 ```
 
 ## Fixed Templates
@@ -79,7 +79,7 @@ $prompt-compliance-optimizer
 $prompt-compliance-optimizer
 
 任务：
-基于当前 updated conversation 和当前 working system prompt，再生成一轮 residual badcase scan。
+基于当前 Updated Conversation 和当前 Working system prompt，再生成一轮 residual badcase scan。
 
 要求：
 - 必须读取 Round History 或 logs/optimization_rounds.jsonl，说明这是第几轮 scan。
@@ -140,6 +140,7 @@ The skill may also trigger when you clearly ask about:
 - Updated Conversation
 - required tool calls
 - Conclusion wording
+- Batch Mode
 
 ## Best Practice
 

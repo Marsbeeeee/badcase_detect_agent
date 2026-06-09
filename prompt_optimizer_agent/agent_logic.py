@@ -2087,6 +2087,15 @@ def _apply_recommendation_full_prompt(
             applied_feedback_summary=str(parsed.get("applied_feedback_summary") or ""),
         )
     except (OpenAIError, requests.RequestException, RuntimeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        patch_retry = _retry_prompt_edit_as_patch(
+            settings=settings,
+            current_system_prompt=current_system_prompt,
+            bad_case=bad_case,
+            payload=payload,
+            failure_reason=str(exc),
+        )
+        if patch_retry is not None:
+            return patch_retry
         return PromptOptimization(
             optimized_prompt=current_system_prompt,
             rationale=(
@@ -2095,6 +2104,52 @@ def _apply_recommendation_full_prompt(
             ),
             applied_feedback_summary="No changes applied.",
         )
+
+
+def _retry_prompt_edit_as_patch(
+    settings: LLMSettings,
+    current_system_prompt: str,
+    bad_case: BadCase,
+    payload: dict[str, Any],
+    failure_reason: str,
+) -> PromptOptimization | None:
+    retry_prompt = (
+        "The previous full-prompt edit failed because the model did not return parseable JSON. "
+        "Do not return the full prompt. Return exactly one small JSON object containing an exact "
+        "replacement patch with keys replace, rationale, and applied_feedback_summary. "
+        "replace.old must be copied exactly from current_system_prompt as one contiguous substring. "
+        "replace.new must be the revised replacement text. Use JSON string escaping for all newlines "
+        "and quotes. No markdown fences, no prose, no comments. Preserve the existing step structure "
+        "and modify the relevant existing branch in place."
+    )
+    retry_payload = {
+        **payload,
+        "failed_full_prompt_edit_reason": failure_reason,
+    }
+    try:
+        content = _chat_json(
+            settings=settings,
+            messages=[
+                {"role": "system", "content": retry_prompt},
+                {"role": "user", "content": json.dumps(retry_payload, ensure_ascii=False)},
+            ],
+            purpose="prompt_edit_json_patch_retry",
+        )
+        parsed = json.loads(content)
+        patched_prompt = _apply_prompt_replace_patch(current_system_prompt, parsed)
+        if patched_prompt is None or patched_prompt == current_system_prompt:
+            return None
+        if _has_step_append_violation(current_system_prompt, patched_prompt):
+            return None
+        if _prompt_edit_style_violation(current_system_prompt, patched_prompt):
+            return None
+        return PromptOptimization(
+            optimized_prompt=patched_prompt,
+            rationale=str(parsed.get("rationale") or "Applied JSON repair patch retry."),
+            applied_feedback_summary=str(parsed.get("applied_feedback_summary") or "Applied prompt patch retry."),
+        )
+    except (OpenAIError, requests.RequestException, RuntimeError, json.JSONDecodeError, ValueError, TypeError):
+        return None
 
 
 def rerun_conversation(
@@ -3167,7 +3222,16 @@ def _manual_recommendation(data: ConversationData, turn_index: int, feedback: st
 def _chat_json(settings: LLMSettings, messages: list[dict[str, str]], purpose: str = "json") -> str:
     if settings.backend == "company_api":
         text = _chat_text(settings=settings, messages=messages, temperature=0.1, purpose=purpose)
-        return _extract_json_object(text)
+        try:
+            return _extract_json_object(text)
+        except json.JSONDecodeError:
+            retry_text = _chat_text(
+                settings=settings,
+                messages=_json_retry_messages(messages, text),
+                temperature=0.0,
+                purpose=f"{purpose}_json_retry",
+            )
+            return _extract_json_object(retry_text)
     client = OpenAI()
     response = client.chat.completions.create(
         model=settings.model,
@@ -3176,6 +3240,26 @@ def _chat_json(settings: LLMSettings, messages: list[dict[str, str]], purpose: s
         response_format={"type": "json_object"},
     )
     return response.choices[0].message.content or "{}"
+
+
+def _json_retry_messages(
+    original_messages: list[dict[str, str]],
+    invalid_response: str,
+) -> list[dict[str, str]]:
+    retry_prompt = (
+        "The previous response was not valid JSON. Re-run the original task and return exactly "
+        "one valid JSON object, with no markdown fences, no prose before or after it, and no "
+        "comments. Preserve the schema requested by the original system message. If the original "
+        "task asked for a full prompt field, include that field as a JSON string."
+    )
+    payload = {
+        "original_messages": original_messages,
+        "invalid_response": invalid_response[:4000],
+    }
+    return [
+        {"role": "system", "content": retry_prompt},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
 
 
 def _chat_text(
@@ -3313,6 +3397,13 @@ def _extract_json_object(text: str) -> str:
         json.loads(text)
         return text
     except json.JSONDecodeError:
+        sanitized_text = _escape_json_string_control_chars(text)
+        if sanitized_text != text:
+            try:
+                json.loads(sanitized_text)
+                return sanitized_text
+            except json.JSONDecodeError:
+                pass
         decoder = json.JSONDecoder()
         for index, char in enumerate(text):
             if char != "{":
@@ -3320,10 +3411,46 @@ def _extract_json_object(text: str) -> str:
             try:
                 parsed, _ = decoder.raw_decode(text[index:])
             except json.JSONDecodeError:
-                continue
+                sanitized_candidate = _escape_json_string_control_chars(text[index:])
+                if sanitized_candidate == text[index:]:
+                    continue
+                try:
+                    parsed, _ = decoder.raw_decode(sanitized_candidate)
+                except json.JSONDecodeError:
+                    continue
             if isinstance(parsed, dict):
                 return json.dumps(parsed, ensure_ascii=False)
         raise
+
+
+def _escape_json_string_control_chars(text: str) -> str:
+    pieces: list[str] = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if escaped:
+            pieces.append(char)
+            escaped = False
+            continue
+        if char == "\\" and in_string:
+            pieces.append(char)
+            escaped = True
+            continue
+        if char == '"':
+            pieces.append(char)
+            in_string = not in_string
+            continue
+        if in_string and char == "\n":
+            pieces.append("\\n")
+            continue
+        if in_string and char == "\r":
+            pieces.append("\\r")
+            continue
+        if in_string and char == "\t":
+            pieces.append("\\t")
+            continue
+        pieces.append(char)
+    return "".join(pieces)
 
 
 def _has_llm_access(settings: LLMSettings) -> bool:

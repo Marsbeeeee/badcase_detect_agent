@@ -323,6 +323,18 @@ def analyze_bad_cases(
 def _local_prompt_rule_bad_cases(data: ConversationData) -> list[BadCase]:
     """Deterministic checks for explicit hard rules that LLM judges often under-count."""
     cases: list[BadCase] = []
+    if data.tools is not None:
+        cases.extend(_local_undefined_tool_call_cases(data))
+    if _prompt_defines_escalation_protocol(data.system_prompt):
+        cases.extend(_local_escalation_protocol_cases(data))
+    if _prompt_requires_busy_brief_moment(data.system_prompt):
+        cases.extend(_local_busy_availability_cases(data))
+    if _prompt_requires_current_year_omission(data.system_prompt):
+        cases.extend(_local_current_year_omission_cases(data))
+    if _prompt_requires_silence_final_stop(data.system_prompt):
+        cases.extend(_local_silence_final_stop_cases(data))
+    if _prompt_requires_late_date_rtp_closing(data.system_prompt):
+        cases.extend(_local_late_payment_proposal_cases(data))
     if _prompt_requires_concrete_payment_fallback(data.system_prompt):
         cases.extend(_local_open_ended_payment_fallback_cases(data))
     if _prompt_requires_ptp_attempt_limit_closing(data.system_prompt):
@@ -330,6 +342,665 @@ def _local_prompt_rule_bad_cases(data: ConversationData) -> list[BadCase]:
     if _prompt_requires_fresh_search_for_inquiries(data.system_prompt):
         cases.extend(_local_missing_fresh_search_cases(data))
     return _dedupe_bad_cases(cases)
+
+
+def _local_undefined_tool_call_cases(data: ConversationData) -> list[BadCase]:
+    available_tools = _available_tool_names(data)
+    if not available_tools:
+        return []
+    cases: list[BadCase] = []
+    for index, turn in enumerate(data.interactions):
+        if turn.role.lower() != "assistant":
+            continue
+        for tool_name in _function_call_names(turn.content):
+            if tool_name.lower() in available_tools:
+                continue
+            cases.append(
+                BadCase(
+                    turn_index=index,
+                    role="assistant",
+                    error_type="undefined_tool_call",
+                    evidence=(
+                        "Violated rule: Assistant function/tool calls must use a tool that is available "
+                        "in the current conversation JSON.\n\n"
+                        "Evidence: "
+                        f"Assistant turn {index} called `{tool_name}`, but the loaded tool definitions only include "
+                        f"{_format_tool_name_list(sorted(available_tools))}."
+                    ),
+                    recommendation=(
+                        "Align the prompt/tool configuration so the assistant only calls tools present in the "
+                        "current file's tool definitions, or add the missing tool definition before rerunning."
+                    ),
+                    source="local_scan",
+                )
+            )
+    return cases
+
+
+def _available_tool_names(data: ConversationData) -> set[str]:
+    names: set[str] = set()
+    if not data.tools:
+        return names
+    for key, value in data.tools.items():
+        if isinstance(key, str) and key.strip():
+            names.add(key.strip().lower())
+        if not isinstance(value, dict):
+            continue
+        function = value.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            names.add(function["name"].strip().lower())
+        elif isinstance(value.get("name"), str):
+            names.add(value["name"].strip().lower())
+    return names
+
+
+def _function_call_names(content: str) -> list[str]:
+    names: list[str] = []
+    for match in re.finditer(
+        r"<function-call>\s*([^:<>\s]+)\s*:",
+        content or "",
+        flags=re.IGNORECASE,
+    ):
+        name = match.group(1).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _format_tool_name_list(names: list[str]) -> str:
+    if not names:
+        return "no tools"
+    if len(names) <= 4:
+        return ", ".join(f"`{name}`" for name in names)
+    return ", ".join(f"`{name}`" for name in names[:4]) + f", and {len(names) - 4} more"
+
+
+def _prompt_defines_escalation_protocol(system_prompt: str) -> bool:
+    lowered = system_prompt.lower()
+    return "escalation" in lowered and ("trigger" in lowered or "6.2" in lowered)
+
+
+def _local_escalation_protocol_cases(data: ConversationData) -> list[BadCase]:
+    cases: list[BadCase] = []
+    pending_trigger: tuple[int, str] | None = None
+    for index, turn in enumerate(data.interactions):
+        role = turn.role.lower()
+        if role == "user":
+            trigger = _user_escalation_trigger(turn.content)
+            if trigger:
+                pending_trigger = (index, trigger)
+            continue
+        if role != "assistant" or pending_trigger is None:
+            continue
+        user_index, trigger = pending_trigger
+        pending_trigger = None
+        if _assistant_satisfies_escalation_action(data.system_prompt, turn.content):
+            continue
+        cases.append(
+            BadCase(
+                turn_index=index,
+                role="assistant",
+                error_type="escalation_action_not_followed",
+                evidence=(
+                    f"Violated rule: {_escalation_rule_excerpt(data.system_prompt)}\n\n"
+                    "Evidence: "
+                    f"User turn {user_index} triggered escalation ({trigger}) with "
+                    f"{_quote_turn(data.interactions[user_index].content)}. "
+                    f"Assistant turn {index} did not execute the required escalation action "
+                    f"({_quote_turn(turn.content)})."
+                ),
+                recommendation=(
+                    "Revise the escalation branch so the first assistant response after any escalation trigger "
+                    "stops the negotiation flow and performs the exact configured escalation action, including "
+                    "the required spoken text and transfer/hotline ending when specified."
+                ),
+                source="local_scan",
+            )
+        )
+    return cases
+
+
+def _user_escalation_trigger(text: str) -> str | None:
+    lowered = _compact_text(text).lower()
+    if _is_conversation_marker(lowered):
+        return None
+    trigger_patterns = (
+        (
+            "dispute_of_debt_or_paid_claim",
+            (
+                r"\balready paid\b",
+                r"\bpaid already\b",
+                r"\bamount is wrong\b",
+                r"\byour system is wrong\b",
+                r"\bi didn'?t borrow\b",
+                r"\bsudah bayar\b",
+                r"\btelah bayar\b",
+                r"\bjumlah(?:nya)? .*?(?:salah|tidak benar|tak betul)\b",
+                r"\bsistem .*?(?:salah|masalah|problem|error)\b",
+                r"金额.*?(?:不对|不正确|错)",
+                r"系统.*?(?:问题|错)",
+                r"(?:已经|己经|早就|上周).*?(?:还|付|付款|缴)",
+                r"明明只借",
+            ),
+        ),
+        (
+            "technical_or_wallet_issue",
+            (
+                r"\bapp .*?(?:problem|issue|error|cannot|can'?t)\b",
+                r"\bwallet .*?(?:problem|issue|error|cannot|can'?t)\b",
+                r"\bdompet .*?(?:masalah|problem|error|tidak bisa|tak boleh)\b",
+                r"(?:钱包|app|应用).*?(?:问题|故障|不能|无法)",
+            ),
+        ),
+        (
+            "overpayment_issue",
+            (
+                r"\boverpaid\b",
+                r"\boverpayment\b",
+                r"\bcharged twice\b",
+                r"\bdeducted twice\b",
+                r"\bterlebih bayar\b",
+                r"\bdipotong dua kali\b",
+                r"(?:多付|多还|扣了两次|连续扣了两次|付的钱比.*?多)",
+            ),
+        ),
+        (
+            "severe_hardship",
+            (
+                r"\bhospital\b",
+                r"\bhospitali[sz]ation\b",
+                r"\baccident\b",
+                r"\bbankrupt",
+                r"\bdeath\b",
+                r"\bpassed away\b",
+                r"\brumah sakit\b",
+                r"\bdirawat\b",
+                r"\bkemalangan\b",
+                r"\bkecelakaan\b",
+                r"(?:医院|住院|车祸|事故|破产|去世|死亡|重病)",
+            ),
+        ),
+        (
+            "explicit_agent_request",
+            (
+                r"\bhuman agent\b",
+                r"\bspeak to (?:a )?(?:human|agent|person)\b",
+                r"\btransfer\b",
+                r"\bagen\b",
+                r"\bcustomer service\b",
+                r"(?:人工|真人|客服|转接|转人工)",
+            ),
+        ),
+        (
+            "alternative_payment_method",
+            (
+                r"\balternative payment\b",
+                r"\banother way to (?:pay|make payment)\b",
+                r"\bpayment method\b",
+                r"\bcara lain\b.*?\bbayar\b",
+                r"\bmetode pembayaran\b",
+                r"(?:其他|别的).*?(?:付款|还款|支付).*?(?:方式|方法)",
+            ),
+        ),
+    )
+    for label, patterns in trigger_patterns:
+        if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in patterns):
+            return label
+    return None
+
+
+def _assistant_satisfies_escalation_action(system_prompt: str, content: str) -> bool:
+    if _prompt_requires_exact_hotline_escalation(system_prompt):
+        return _assistant_outputs_hotline_escalation(content)
+    if _prompt_requires_spoken_transfer_escalation(system_prompt):
+        return _assistant_outputs_spoken_transfer_escalation(content)
+    return _assistant_outputs_any_escalation(content)
+
+
+def _prompt_requires_exact_hotline_escalation(system_prompt: str) -> bool:
+    lowered = system_prompt.lower()
+    return "deliver the following message exactly" in lowered and "hotline" in lowered
+
+
+def _prompt_requires_spoken_transfer_escalation(system_prompt: str) -> bool:
+    lowered = system_prompt.lower()
+    return (
+        ("spoken text" in lowered or "empathetic sentence" in lowered or "empathetic phrase" in lowered)
+        and ("transfergroup" in lowered or "human officer" in lowered or "human agent" in lowered)
+    )
+
+
+def _assistant_outputs_hotline_escalation(content: str) -> bool:
+    lowered = _compact_text(content).lower()
+    if _is_tool_only_assistant(content):
+        return False
+    return "hotline" in lowered and "<dialog-end>" in lowered
+
+
+def _assistant_outputs_spoken_transfer_escalation(content: str) -> bool:
+    if _is_tool_only_assistant(content):
+        return False
+    lowered = _compact_text(content).lower()
+    has_transfer = any(
+        term in lowered
+        for term in (
+            "human officer",
+            "human agent",
+            "agent",
+            "transfer",
+            "agen",
+            "pegawai",
+            "petugas",
+            "人工",
+            "客服",
+            "转接",
+        )
+    )
+    has_forbidden_negotiation = _assistant_mentions_payment_or_debt_details(content)
+    return has_transfer and not has_forbidden_negotiation
+
+
+def _assistant_outputs_any_escalation(content: str) -> bool:
+    lowered = _compact_text(content).lower()
+    return (
+        "hotline" in lowered
+        or "dialog-end" in lowered
+        or "transfer_to_human" in lowered
+        or "transfergroup" in lowered
+        or "group1" in lowered
+    )
+
+
+def _is_tool_only_assistant(content: str) -> bool:
+    if not _looks_like_tool_wrapper(content):
+        return False
+    without_wrappers = re.sub(
+        r"<function-call>.*?</function-call>",
+        "",
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    without_wrappers = re.sub(
+        r"<tool-call>.*?</tool-call>",
+        "",
+        without_wrappers,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return not without_wrappers.strip()
+
+
+def _assistant_mentions_payment_or_debt_details(content: str) -> bool:
+    lowered = _compact_text(content).lower()
+    return any(
+        term in lowered
+        for term in (
+            "pay",
+            "payment",
+            "settle",
+            "loan",
+            "overdue",
+            "bayar",
+            "pembayaran",
+            "pinjaman",
+            "tunggakan",
+            "欠款",
+            "逾期",
+            "还款",
+            "贷款",
+        )
+    )
+
+
+def _escalation_rule_excerpt(system_prompt: str) -> str:
+    compacted = _compact_text(system_prompt)
+    match = re.search(
+        r"(?:6\.1\s+)?Escalation Action[:：]?\s*(.{0,520}?)(?:6\.2\s+Escalation Triggers|# PART 2|$)",
+        compacted,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return _quote_turn(match.group(1), max_chars=260)
+    return "When an escalation trigger occurs, immediately stop the core flow and execute the configured escalation action."
+
+
+def _prompt_requires_busy_brief_moment(system_prompt: str) -> bool:
+    lowered = system_prompt.lower()
+    return "busy" in lowered and "brief moment" in lowered
+
+
+def _local_busy_availability_cases(data: ConversationData) -> list[BadCase]:
+    cases: list[BadCase] = []
+    pending_busy_user_index: int | None = None
+    for index, turn in enumerate(data.interactions):
+        role = turn.role.lower()
+        if role == "user":
+            if _user_says_busy_or_unavailable(turn.content):
+                pending_busy_user_index = index
+            continue
+        if role != "assistant" or pending_busy_user_index is None:
+            continue
+        user_index = pending_busy_user_index
+        pending_busy_user_index = None
+        if _assistant_checks_brief_moment(turn.content):
+            continue
+        cases.append(
+            BadCase(
+                turn_index=index,
+                role="assistant",
+                error_type="busy_availability_check_skipped",
+                evidence=(
+                    "Violated rule: When the user says they are busy or unavailable, the assistant must "
+                    "acknowledge that and check whether they have a brief moment before continuing.\n\n"
+                    "Evidence: "
+                    f"User turn {user_index} said they were busy/unavailable "
+                    f"({_quote_turn(data.interactions[user_index].content)}). Assistant turn {index} continued "
+                    f"without a brief-moment availability check ({_quote_turn(turn.content)})."
+                ),
+                recommendation=(
+                    "Revise the busy/not-available branch so it first checks whether the user has a brief "
+                    "moment, then follows the prompt's configured payment or callback sequence."
+                ),
+                source="local_scan",
+            )
+        )
+    return cases
+
+
+def _user_says_busy_or_unavailable(text: str) -> bool:
+    lowered = _compact_text(text).lower()
+    return any(
+        re.search(pattern, lowered)
+        for pattern in (
+            r"\bbusy\b",
+            r"\bin a meeting\b",
+            r"\bdriving\b",
+            r"\bnot available\b",
+            r"\bcan'?t talk\b",
+            r"\bsibuk\b",
+            r"\blagi narik\b",
+            r"\btidak bisa bicara\b",
+            r"\btak boleh bercakap\b",
+            r"(?:很忙|没空|不方便|不能说话|在开会|在忙)",
+        )
+    )
+
+
+def _assistant_checks_brief_moment(text: str) -> bool:
+    lowered = _compact_text(text).lower()
+    return any(
+        term in lowered
+        for term in (
+            "brief moment",
+            "a moment",
+            "sedikit waktu",
+            "sebentar",
+            "sejenak",
+            "masa sebentar",
+            "一点时间",
+            "一会儿",
+            "方便",
+        )
+    )
+
+
+def _prompt_requires_current_year_omission(system_prompt: str) -> bool:
+    lowered = system_prompt.lower()
+    return "must omit the year" in lowered or "year 2026 must be omitted" in lowered
+
+
+def _local_current_year_omission_cases(data: ConversationData) -> list[BadCase]:
+    current_year = _current_year_from_prompt(data.system_prompt)
+    if current_year is None:
+        return []
+    for index, turn in enumerate(data.interactions):
+        if turn.role.lower() != "assistant":
+            continue
+        if _looks_like_tool_wrapper(turn.content):
+            continue
+        if not _looks_like_payment_confirmation(turn.content):
+            continue
+        if not _contains_current_year_reference(turn.content, current_year):
+            continue
+        return [
+            BadCase(
+                turn_index=index,
+                role="assistant",
+                error_type="current_year_not_omitted_in_date",
+                evidence=(
+                    "Violated rule: Date verbalization for dates in the current year must omit the year.\n\n"
+                    "Evidence: "
+                    f"The prompt requires omitting {current_year} for current-year payment dates, but assistant "
+                    f"turn {index} included the year in the payment confirmation "
+                    f"({_quote_turn(turn.content)})."
+                ),
+                recommendation=(
+                    "Revise the date-verbalization and PTP closing instructions so current-year dates are "
+                    "rendered without the year in the active language."
+                ),
+                source="local_scan",
+            )
+        ]
+    return []
+
+
+def _current_year_from_prompt(system_prompt: str) -> int | None:
+    patterns = (
+        r"current year\s*\(?(\d{4})\)?",
+        r"today'?s reference date is [^`\n]*?(\d{4})",
+        r"today'?s date is\s*`?[^`\n]*?(\d{4})",
+        r"reference date[:：]\s*`?[^`\n]*?(\d{4})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, system_prompt, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _looks_like_payment_confirmation(text: str) -> bool:
+    lowered = _compact_text(text).lower()
+    return any(
+        term in lowered
+        for term in (
+            "commitment",
+            "confirm",
+            "payment",
+            "pay",
+            "bayaran",
+            "pembayaran",
+            "komitmen",
+            "membuat bayaran",
+            "还款",
+            "付款",
+            "承诺",
+            "确认",
+        )
+    )
+
+
+def _contains_current_year_reference(text: str, year: int) -> bool:
+    lowered = _compact_text(text).lower()
+    if str(year) in lowered:
+        return True
+    if year == 2026:
+        return any(
+            term in lowered
+            for term in (
+                "twenty twenty-six",
+                "twenty twenty six",
+                "dua ribu dua puluh enam",
+                "二零二六",
+                "二〇二六",
+                "两千零二十六",
+            )
+        )
+    return False
+
+
+def _prompt_requires_silence_final_stop(system_prompt: str) -> bool:
+    lowered = system_prompt.lower()
+    return "silence" in lowered and ("third consecutive" in lowered or "3rd silence" in lowered)
+
+
+def _local_silence_final_stop_cases(data: ConversationData) -> list[BadCase]:
+    consecutive_silences = 0
+    for index, turn in enumerate(data.interactions):
+        role = turn.role.lower()
+        if role == "user":
+            if _is_silence_turn(turn.content):
+                consecutive_silences += 1
+            else:
+                consecutive_silences = 0
+            continue
+        if role != "assistant":
+            continue
+        if consecutive_silences < 3:
+            continue
+        if "<dialog-end>" in turn.content.lower() and not _assistant_asks_question(turn.content):
+            consecutive_silences = 0
+            continue
+        return [
+            BadCase(
+                turn_index=index,
+                role="assistant",
+                error_type="third_silence_stop_not_followed",
+                evidence=(
+                    "Violated rule: On the third consecutive silence, the assistant must stop asking questions "
+                    "and immediately produce the configured call-termination script.\n\n"
+                    "Evidence: "
+                    f"Before assistant turn {index}, the user had reached {consecutive_silences} consecutive "
+                    f"silence turns. Assistant turn {index} did not stop with a terminal script "
+                    f"({_quote_turn(turn.content)})."
+                ),
+                recommendation=(
+                    "Revise silence handling so the third consecutive `<silence>` routes directly to the "
+                    "terminal closing script with `<dialog-end>` and no further questions."
+                ),
+                source="local_scan",
+            )
+        ]
+    return []
+
+
+def _is_silence_turn(text: str) -> bool:
+    normalized = _compact_text(text).strip().lower()
+    return normalized in {"<silence>", "", "silence"}
+
+
+def _assistant_asks_question(text: str) -> bool:
+    lowered = _compact_text(text).lower()
+    return "?" in lowered or any(
+        term in lowered
+        for term in (
+            "can you",
+            "could you",
+            "are you",
+            "boleh",
+            "apakah",
+            "adakah",
+            "bisa",
+            "请问",
+            "可以吗",
+            "吗",
+        )
+    )
+
+
+def _prompt_requires_late_date_rtp_closing(system_prompt: str) -> bool:
+    lowered = system_prompt.lower()
+    return (
+        "rtp_closing" in lowered
+        and (
+            "later than" in lowered
+            or "greater than" in lowered
+            or ">" in lowered
+            or "maximum payment date" in lowered
+        )
+        and ("not negotiate" in lowered or "immediately proceed" in lowered or "immediately proceed to" in lowered)
+    )
+
+
+def _local_late_payment_proposal_cases(data: ConversationData) -> list[BadCase]:
+    cases: list[BadCase] = []
+    pending_late_user_index: int | None = None
+    for index, turn in enumerate(data.interactions):
+        role = turn.role.lower()
+        if role == "user":
+            if _user_proposes_late_payment_date(turn.content):
+                pending_late_user_index = index
+            continue
+        if role != "assistant" or pending_late_user_index is None:
+            continue
+        user_index = pending_late_user_index
+        pending_late_user_index = None
+        if _assistant_moves_to_rtp_closing(turn.content):
+            continue
+        cases.append(
+            BadCase(
+                turn_index=index,
+                role="assistant",
+                error_type="late_payment_proposal_not_rtp_closing",
+                evidence=(
+                    "Violated rule: When the user proposes a payment date later than the maximum allowed "
+                    "date, the assistant must immediately proceed to RTP_Closing and must not negotiate "
+                    "or attempt to adjust the date.\n\n"
+                    "Evidence: "
+                    f"User turn {user_index} proposed a late payment timing "
+                    f"({_quote_turn(data.interactions[user_index].content)}). Assistant turn {index} continued "
+                    f"negotiating or asking a follow-up instead of moving directly to RTP_Closing "
+                    f"({_quote_turn(turn.content)})."
+                ),
+                recommendation=(
+                    "Revise the late-date validation branch so any proposal beyond the maximum date routes "
+                    "directly to RTP_Closing, with no follow-up question or attempt to pull the date earlier."
+                ),
+                source="local_scan",
+            )
+        )
+    return cases
+
+
+def _user_proposes_late_payment_date(text: str) -> bool:
+    lowered = _compact_text(text).lower()
+    return any(
+        term in lowered
+        for term in (
+            "next month",
+            "bulan depan",
+            "month depan",
+            "minggu depan",
+            "next week",
+            "下个月",
+            "下個月",
+            "下周",
+            "下星期",
+        )
+    )
+
+
+def _assistant_moves_to_rtp_closing(text: str) -> bool:
+    lowered = _compact_text(text).lower()
+    if _assistant_asks_question(text):
+        return False
+    if _asks_open_ended_payment_terms(text):
+        return False
+    return any(
+        term in lowered
+        for term in (
+            "rtp_closing",
+            "follow-up calls",
+            "follow up calls",
+            "panggilan lanjutan",
+            "panggilan susulan",
+            "legal",
+            "biaya tambahan",
+            "denda tambahan",
+            "maintain a positive payment history",
+            "status akun",
+            "保持良好",
+            "后续致电",
+        )
+    )
 
 
 def _prompt_requires_concrete_payment_fallback(system_prompt: str) -> bool:
@@ -461,7 +1132,7 @@ def _missing_fresh_search_bad_case(
         evidence=evidence,
         recommendation=(
             "Revise the inquiry/promotion workflow so every promotion-related customer message triggers "
-            "MandiriCX_Call_Center_search_promotion before any factual product or promotion answer, including "
+            "the required fresh-search tool before any factual product or promotion answer, including "
             "follow-up confirmations and corrections."
         ),
         source="local_scan",
@@ -680,23 +1351,61 @@ def _previous_assistant_index(data: ConversationData, before_index: int) -> int 
 
 
 def _proposes_full_payment_today(text: str) -> bool:
-    lowered = text.lower()
+    lowered = _compact_text(text).lower()
     return (
-        "today" in lowered
-        and ("payment" in lowered or "pay" in lowered or "settle" in lowered)
-        and ("full" in lowered or re.search(r"\b\d+(?:\.\d+)?\b", lowered) is not None)
+        any(term in lowered for term in ("today", "hari ini", "今天"))
+        and any(
+            term in lowered
+            for term in (
+                "payment",
+                "pay",
+                "settle",
+                "bayar",
+                "pembayaran",
+                "bayaran",
+                "selesaikan",
+                "melakukan pembayaran",
+                "还款",
+                "付款",
+                "支付",
+            )
+        )
+        and (
+            any(term in lowered for term in ("full", "penuh", "lunas", "全部", "全额"))
+            or re.search(r"\b\d+(?:\.\d+)?\b", lowered) is not None
+            or any(term in lowered for term in ("ratus", "ribu", "ringgit", "rupiah", "令吉", "百", "千"))
+        )
     )
 
 
 def _asks_open_ended_payment_terms(text: str) -> bool:
     lowered = _compact_text(text).lower()
-    if not any(term in lowered for term in ("pay", "payment", "settle")):
+    if not any(
+        term in lowered
+        for term in (
+            "pay",
+            "payment",
+            "settle",
+            "bayar",
+            "pembayaran",
+            "bayaran",
+            "selesaikan",
+            "还款",
+            "付款",
+            "支付",
+        )
+    ):
         return False
     patterns = (
         r"\b(when|what date|which date)\b.{0,140}\b(pay|payment|settle|make a payment|make payment)\b",
         r"\b(pay|payment|settle|make a payment|make payment)\b.{0,140}\b(when|what date|which date)\b",
         r"\b(let me know|tell me|share|provide|give me)\b.{0,140}\b(date|amount|when|how much)\b",
         r"\bhow much\b.{0,140}\b(pay|payment|settle)\b",
+        r"\b(?:kapan|bila|bilakah|tanggal|tarikh)\b.{0,140}\b(?:bayar|pembayaran|bayaran|melakukan pembayaran|selesaikan)\b",
+        r"\b(?:bayar|pembayaran|bayaran|melakukan pembayaran|selesaikan)\b.{0,140}\b(?:kapan|bila|bilakah|tanggal|tarikh)\b",
+        r"\b(?:berapa)\b.{0,140}\b(?:bayar|pembayaran|bayaran|selesaikan)\b",
+        r"(?:什么时候|哪天|几号|什么日期).{0,80}(?:还款|付款|支付|还|付)",
+        r"(?:还款|付款|支付|还|付).{0,80}(?:什么时候|哪天|几号|什么日期|多少)",
     )
     return any(re.search(pattern, lowered) for pattern in patterns)
 
@@ -719,6 +1428,8 @@ def _looks_like_payment_negotiation_turn(text: str) -> bool:
     lowered = text.lower()
     return (
         ("overdue" in lowered and ("loan" in lowered or "payment" in lowered))
+        or ("tunggakan" in lowered and ("pinjaman" in lowered or "pembayaran" in lowered or "bayaran" in lowered))
+        or ("逾期" in lowered and ("贷款" in lowered or "款项" in lowered or "还款" in lowered))
         or "payment hasn't been made" in lowered
         or _proposes_full_payment_today(text)
         or _asks_open_ended_payment_terms(text)
@@ -746,6 +1457,20 @@ def _is_payment_refusal(text: str) -> bool:
         r"\bdo not plan\b",
         r"\bno money\b",
         r"\bnot able\b",
+        r"\bbelum bisa\b",
+        r"\btidak bisa\b",
+        r"\btidak dapat\b",
+        r"\btak bisa\b",
+        r"\btak boleh\b",
+        r"\btak dapat\b",
+        r"\bbelum boleh\b",
+        r"\bbelum dapat\b",
+        r"\btidak mempunyai\b",
+        r"\btiada duit\b",
+        r"\btak ada duit\b",
+        r"\btidak ada uang\b",
+        r"\btidak ada wang\b",
+        r"(?:没钱|沒有錢|不能还|无法还|还不上|不想还|不还|不能付|无法付|付不了)",
     )
     return any(re.search(pattern, lowered) for pattern in refusal_patterns)
 
@@ -773,6 +1498,18 @@ def _contains_concrete_payment_date(text: str) -> bool:
         "this weekend",
         "next week",
         "next month",
+        "hari ini",
+        "besok",
+        "lusa",
+        "minggu depan",
+        "bulan depan",
+        "tanggal",
+        "tarikh",
+        "今天",
+        "明天",
+        "后天",
+        "下周",
+        "下个月",
     )
     return any(term in lowered for term in date_terms)
 
@@ -796,6 +1533,9 @@ def _payment_term_question_excerpt(text: str) -> str:
         r"please (?:let me know|provide|tell me|share|give me)[^?.!]*(?:payment|date|when|amount)[^?.!]*[?.!]?",
         r"(?:when|what date|which date)[^?.!]*(?:pay|payment|settle)[^?.!]*[?.!]?",
         r"(?:how much)[^?.!]*(?:pay|payment|settle)[^?.!]*[?.!]?",
+        r"(?:kapan|bila|bilakah|tanggal|tarikh)[^?.!]*(?:bayar|pembayaran|bayaran|selesaikan)[^?.!]*[?.!]?",
+        r"(?:bayar|pembayaran|bayaran|selesaikan)[^?.!]*(?:kapan|bila|bilakah|tanggal|tarikh)[^?.!]*[?.!]?",
+        r"(?:什么时候|哪天|几号|什么日期)[^?.!]*(?:还款|付款|支付|还|付)[^?.!]*[?.!]?",
     )
     for pattern in patterns:
         match = re.search(pattern, compacted, flags=re.IGNORECASE)
@@ -1076,6 +1816,10 @@ def _looks_like_tool_wrapper(content: str) -> bool:
         or (
             stripped.startswith("{\"")
             and any(term in stripped[:120] for term in ("function", "tool", "arguments", "name"))
+        )
+        or (
+            stripped.startswith("[{\"")
+            and any(term in stripped[:160] for term in ("function", "tool", "arguments", "name"))
         )
     )
 

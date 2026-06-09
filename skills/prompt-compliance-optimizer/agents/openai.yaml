@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prompt Compliance Optimizer"
+  short_description: "Run prompt-compliance badcase workflows"
+  default_prompt: "Use $prompt-compliance-optimizer to inspect a prompt-compliance badcase and rerun the target turn."

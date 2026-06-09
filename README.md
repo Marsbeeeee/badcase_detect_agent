@@ -20,6 +20,35 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Codex Skill Sync
+
+这个仓库同时保存 Codex skill 源文件：
+
+```text
+skills/prompt-compliance-optimizer/
+```
+
+在新电脑或更新后，把仓库内 skill 同步到 Codex 的 skill 目录：
+
+```bash
+cd /path/to/prompt_optimizer_agent
+mkdir -p ~/.codex/skills/prompt-compliance-optimizer
+rsync -a --delete skills/prompt-compliance-optimizer/ ~/.codex/skills/prompt-compliance-optimizer/
+```
+
+之后在 Codex 里可以这样调用：
+
+```text
+$prompt-compliance-optimizer 批量找这些 JSON 里的 badcase
+```
+
+每次这个仓库更新后，在另一台电脑执行：
+
+```bash
+git pull
+rsync -a --delete skills/prompt-compliance-optimizer/ ~/.codex/skills/prompt-compliance-optimizer/
+```
+
 如果使用 OpenAI：
 
 ```bash

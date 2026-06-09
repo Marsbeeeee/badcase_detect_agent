@@ -684,41 +684,122 @@ def rerun_targets_for_cases(data: ConversationData, cases: list[BadCase]) -> set
 
 def required_tools_for_cases(data: ConversationData, cases: list[BadCase]) -> dict[int, str]:
     required: dict[int, str] = {}
-    promotion_tool = promotion_search_tool_name(data.tools)
-    if not promotion_tool:
-        return required
     for case in cases:
-        if not case_requires_promotion_search_tool(case):
+        tool_name = required_tool_name_for_case(data.tools, case)
+        if not tool_name:
             continue
         for target_index in rerun_targets_for_cases(data, [case]):
-            required[target_index] = promotion_tool
+            required[target_index] = tool_name
     return required
 
 
-def case_requires_promotion_search_tool(case: BadCase) -> bool:
-    text = " ".join([case.error_type, case.evidence, case.recommendation]).lower()
-    return (
-        "missing_fresh_promotion_search" in text
-        or (
-            "promotion" in text
-            and ("search_promotion" in text or "fresh search" in text)
+def required_tool_name_for_case(tools: dict | None, case: BadCase) -> str | None:
+    if not case_is_missing_required_tool_call(case):
+        return None
+    tool_names = available_tool_names(tools)
+    if not tool_names:
+        return None
+    text = bad_case_text(case)
+    lowered = text.lower()
+    for tool_name in tool_names:
+        if tool_name.lower() in lowered:
+            return tool_name
+    return best_matching_tool_name(tool_names, text)
+
+
+def case_is_missing_required_tool_call(case: BadCase) -> bool:
+    lowered = bad_case_text(case).lower()
+    missing_signal = any(
+        phrase in lowered
+        for phrase in (
+            "missing",
+            "no ",
+            "without",
+            "skipped",
+            "skip",
+            "requires",
+            "require",
+            "must call",
+            "should call",
+            "before answering",
         )
     )
+    tool_signal = any(
+        phrase in lowered
+        for phrase in (
+            "tool",
+            "function",
+            "call",
+            "fresh search",
+            "search",
+            "retrieval",
+            "retrieve",
+            "lookup",
+            "look up",
+        )
+    )
+    return missing_signal and tool_signal
 
 
-def promotion_search_tool_name(tools: dict | None) -> str | None:
+def available_tool_names(tools: dict | None) -> list[str]:
     if not tools:
-        return None
-    preferred = "MandiriCX_Call_Center_search_promotion"
-    if preferred in tools:
-        return preferred
-    for name in tools:
-        if str(name).lower().endswith("search_promotion"):
-            return str(name)
-    for name in tools:
-        if "search_promotion" in str(name).lower():
-            return str(name)
-    return None
+        return []
+    names: list[str] = []
+    for key, value in tools.items():
+        if key:
+            names.append(str(key))
+        if isinstance(value, dict):
+            function = value.get("function")
+            if isinstance(function, dict) and function.get("name"):
+                names.append(str(function["name"]))
+            elif value.get("name"):
+                names.append(str(value["name"]))
+    return list(dict.fromkeys(names))
+
+
+def best_matching_tool_name(tool_names: list[str], text: str) -> str | None:
+    text_tokens = set(normalized_tool_tokens(text))
+    best_name = None
+    best_score = 0
+    for tool_name in tool_names:
+        tool_tokens = [
+            token
+            for token in normalized_tool_tokens(tool_name)
+            if token
+            not in {
+                "tool",
+                "call",
+                "get",
+                "set",
+                "search",
+                "lookup",
+                "retrieve",
+                "retrieval",
+                "function",
+                "api",
+            }
+        ]
+        if not tool_tokens:
+            continue
+        score = len(set(tool_tokens) & text_tokens)
+        lowered_tool = tool_name.lower()
+        lowered_text = text.lower()
+        if "search" in lowered_tool and "search" in lowered_text:
+            score += 1
+        if "retrieval" in lowered_tool and "retrieval" in lowered_text:
+            score += 1
+        if score > best_score:
+            best_name = tool_name
+            best_score = score
+    return best_name if best_score > 0 else None
+
+
+def normalized_tool_tokens(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", text).lower())
+
+
+def bad_case_text(case: BadCase) -> str:
+    return " ".join([case.error_type, case.evidence, case.recommendation])
 
 
 def rerun_with_prompt(

@@ -185,8 +185,11 @@ def run_apply(args: argparse.Namespace) -> int:
         "file_count": len(file_results),
         "approved_case_count": sum(item["approved_case_count"] for item in file_results),
         "applied_case_count": sum(item["applied_case_count"] for item in file_results),
+        "fixed_case_count": sum(item.get("fixed_case_count", 0) for item in file_results),
         "unsupported_case_count": sum(len(item["unsupported_cases"]) for item in file_results),
+        "verification_failure_count": sum(len(item.get("verification_failures") or []) for item in file_results),
         "residual_badcase_count": sum(item["residual_badcase_count"] for item in file_results),
+        "failure_category_counts": failure_category_counts(file_results),
         "files": file_results,
     }
     conclusion_json = output_dir / "batch_apply_conclusion.json"
@@ -200,8 +203,11 @@ def run_apply(args: argparse.Namespace) -> int:
                 "batch_id": batch_id,
                 "approved_case_count": conclusion["approved_case_count"],
                 "applied_case_count": conclusion["applied_case_count"],
+                "fixed_case_count": conclusion["fixed_case_count"],
                 "unsupported_case_count": conclusion["unsupported_case_count"],
+                "verification_failure_count": conclusion["verification_failure_count"],
                 "residual_badcase_count": conclusion["residual_badcase_count"],
+                "failure_category_counts": conclusion["failure_category_counts"],
                 "conclusion_json": str(conclusion_json),
                 "conclusion_md": str(conclusion_md),
             },
@@ -328,6 +334,8 @@ def apply_file_record(
         for case in _local_prompt_rule_bad_cases(updated_data)
         if case.turn_index >= 0
     ]
+    verification_failures = build_verification_failures(applied_case_records, residual_cases)
+    fixed_case_count = max(0, len(applied_case_records) - len(verification_failures))
 
     output_path = output_dir / f"{source.stem}_updated.json"
     output_path.write_text(
@@ -352,6 +360,16 @@ def apply_file_record(
             "after_version": "batch Apply" if updated_data.system_prompt != data.system_prompt else "external Original",
             "residual_badcase_count": len(residual_cases),
             "residual_badcases": residual_cases,
+            "fixed_case_count": fixed_case_count,
+            "verification_failures": verification_failures,
+            "failure_category_counts": failure_category_counts(
+                [
+                    {
+                        "unsupported_cases": unsupported_cases,
+                        "verification_failures": verification_failures,
+                    }
+                ]
+            ),
             "required_tools": sorted(
                 {
                     str(case.get("required_tool"))
@@ -381,6 +399,7 @@ def apply_required_tool_cases(
                 **case,
                 "applied": True,
                 "fix_type": "conversation_only_required_tool",
+                "repair_class": "missing_required_tool_call",
                 "required_tool": required_tool,
             }
         )
@@ -429,9 +448,15 @@ def apply_prompt_cases_with_llm(
             }
         )
         if optimization.optimized_prompt == working_prompt:
+            failure_category = classify_prompt_edit_failure(
+                data=data,
+                case=case,
+                rationale=optimization.rationale,
+            )
             unsupported_cases.append(
                 {
                     **case,
+                    "failure_category": failure_category,
                     "reason": (
                         "Prompt-edit backend returned no in-place prompt change for this "
                         "non-tool-call case."
@@ -446,6 +471,7 @@ def apply_prompt_cases_with_llm(
                 **case,
                 "applied": True,
                 "fix_type": "prompt_edit_targeted_rerun",
+                "repair_class": "fixable_by_prompt_clarification",
                 "applied_feedback_summary": optimization.applied_feedback_summary,
             }
         )
@@ -472,6 +498,7 @@ def apply_prompt_cases_with_llm(
                     **case,
                     "applied": True,
                     "fix_type": "llm_rerun_required_tool",
+                    "repair_class": "missing_required_tool_call",
                     "required_tool": required_tool,
                 }
             )
@@ -520,7 +547,126 @@ def apply_result_base(
         "unsupported_cases": unsupported_cases,
         "residual_badcase_count": 0,
         "residual_badcases": [],
+        "fixed_case_count": 0,
+        "verification_failures": [],
+        "failure_category_counts": {},
     }
+
+
+def classify_prompt_edit_failure(
+    *,
+    data: ConversationData,
+    case: dict[str, Any],
+    rationale: str,
+) -> str:
+    if case_lacks_required_ground_truth(data, case):
+        return "unsupported_by_missing_ground_truth"
+    lowered = rationale.lower()
+    backend_failure_signals = (
+        "llm prompt edit failed",
+        "unterminated string",
+        "invalid json",
+        "not valid json",
+        "json contract",
+        "failed to parse",
+        "patch failed",
+    )
+    if any(signal in lowered for signal in backend_failure_signals):
+        return "backend_failed_to_patch"
+    return "fixable_by_prompt_clarification"
+
+
+def case_lacks_required_ground_truth(data: ConversationData, case: dict[str, Any]) -> bool:
+    if case_requires_exact_spoken_message(case):
+        return not prompt_has_exact_message_ground_truth(data.system_prompt)
+    return False
+
+
+def prompt_has_exact_message_ground_truth(system_prompt: str) -> bool:
+    prompt = system_prompt.lower()
+    if not any(phrase in prompt for phrase in ("message exactly", "say exactly", "deliver the following message exactly")):
+        return False
+    quoted_exact_message = re.search(
+        r"(?:message exactly|say exactly|deliver the following message exactly)\s*[:：]?\s*[\"“][^\"”]{20,}[\"”]",
+        system_prompt,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if quoted_exact_message:
+        return True
+    return "hotline" in prompt or "transfer" in prompt
+
+
+def build_verification_failures(
+    applied_cases: list[dict[str, Any]],
+    residual_cases: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    used_residual_indices: set[int] = set()
+    for applied in applied_cases:
+        residual_index, residual = matching_residual_case(applied, residual_cases, used_residual_indices)
+        if residual is None:
+            continue
+        used_residual_indices.add(residual_index)
+        failures.append(
+            {
+                "case_id": str(applied.get("id") or ""),
+                "turn_index": applied.get("turn_index"),
+                "error_type": applied.get("error_type"),
+                "fix_type": applied.get("fix_type"),
+                "repair_class": applied.get("repair_class"),
+                "failure_category": "patch_applied_but_failed_verification",
+                "reason": (
+                    "A prompt change and/or targeted rerun was applied, but the residual scan "
+                    "still found the same rule violation."
+                ),
+                "residual_case_id": residual.get("id"),
+                "residual_turn_index": residual.get("turn_index"),
+                "residual_evidence": residual.get("evidence"),
+                "next_experiment": next_experiment_for_failed_case(applied),
+            }
+        )
+    return failures
+
+
+def matching_residual_case(
+    applied: dict[str, Any],
+    residual_cases: list[dict[str, Any]],
+    used_indices: set[int],
+) -> tuple[int, dict[str, Any] | None]:
+    applied_error = str(applied.get("error_type") or "")
+    applied_turn = applied.get("turn_index")
+    for index, residual in enumerate(residual_cases):
+        if index in used_indices:
+            continue
+        if residual.get("error_type") == applied_error and residual.get("turn_index") == applied_turn:
+            return index, residual
+    for index, residual in enumerate(residual_cases):
+        if index in used_indices:
+            continue
+        if residual.get("error_type") == applied_error:
+            return index, residual
+    return -1, None
+
+
+def next_experiment_for_failed_case(case: dict[str, Any]) -> str:
+    error_type = str(case.get("error_type") or "")
+    if error_type == "late_payment_proposal_not_rtp_closing":
+        return "Strengthen the RTP_Closing rule into deterministic forbidden/required outputs, then rerun the target turn."
+    if error_type == "escalation_action_not_followed":
+        return "Extract or confirm the exact escalation message, then force deterministic spoken text plus any required action."
+    return "Clarify the violated prompt rule into machine-checkable required and forbidden behavior, then rerun."
+
+
+def failure_category_counts(file_results: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in file_results:
+        for case in item.get("unsupported_cases") or []:
+            category = str(case.get("failure_category") or "unknown")
+            counts[category] = counts.get(category, 0) + 1
+        for failure in item.get("verification_failures") or []:
+            category = str(failure.get("failure_category") or "unknown")
+            counts[category] = counts.get(category, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def load_approved_ids(args: argparse.Namespace, review: dict[str, Any]) -> set[str]:
@@ -976,8 +1122,11 @@ def apply_round_event(result: dict[str, Any]) -> dict[str, Any]:
         "updated_file": result.get("updated_file"),
         "approved_trace_count": result.get("approved_case_count", 0),
         "applied_trace_count": result.get("applied_case_count", 0),
+        "fixed_trace_count": result.get("fixed_case_count", 0),
         "badcases": result.get("applied_cases", []),
         "unsupported_cases": result.get("unsupported_cases", []),
+        "verification_failures": result.get("verification_failures", []),
+        "failure_category_counts": result.get("failure_category_counts", {}),
         "required_tools": result.get("required_tools", []),
         "apply_mode": result.get("apply_mode"),
         "apply_backend": result.get("apply_backend"),
@@ -1010,6 +1159,8 @@ def residual_round_event(result: dict[str, Any]) -> dict[str, Any]:
         "badcase_count": result.get("residual_badcase_count", 0),
         "analysis_error_count": 0,
         "badcases": result.get("residual_badcases", []),
+        "verification_failures": result.get("verification_failures", []),
+        "failure_category_counts": result.get("failure_category_counts", {}),
         "analysis_errors": [],
         "parent_apply_round_id": result.get("apply_event_id"),
     }
@@ -1086,8 +1237,24 @@ def render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
         "",
         (
             f"Residual scan found {conclusion['residual_badcase_count']} remaining badcase(s). "
-            f"Unsupported approved cases: {conclusion['unsupported_case_count']}."
+            f"Unsupported approved cases: {conclusion['unsupported_case_count']}. "
+            f"Verification failures: {conclusion.get('verification_failure_count', 0)}."
         ),
+        "",
+        f"Failure categories: {format_failure_category_counts(conclusion.get('failure_category_counts') or {})}",
+        "",
+        "## 中文摘要",
+        "",
+        f"- 人工确认的 badcase：{conclusion['approved_case_count']} 个",
+        f"- 已尝试应用改动：{conclusion['applied_case_count']} 个",
+        f"- 已通过 residual scan 验证修复：{conclusion.get('fixed_case_count', 0)} 个",
+        f"- 未能自动应用改动：{conclusion['unsupported_case_count']} 个",
+        f"- 已改动但验收失败：{conclusion.get('verification_failure_count', 0)} 个",
+        f"- residual scan 仍剩余：{conclusion['residual_badcase_count']} 个",
+        "",
+        "失败分类：",
+        "",
+        *format_failure_category_lines_zh(conclusion.get("failure_category_counts") or {}),
         "",
         "## Files",
         "",
@@ -1104,9 +1271,19 @@ def render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
                 f"  - rerun_target_turns: {', '.join(str(turn) for turn in item.get('rerun_target_turns') or []) or 'none'}",
                 f"  - rerun_errors: {len(item.get('rerun_errors') or [])}",
                 f"  - required_tools: {', '.join(item.get('required_tools') or []) or 'none'}",
-                f"  - applied: {item.get('applied_case_count', 0)}, residual: {item.get('residual_badcase_count', 0)}, unsupported: {len(item.get('unsupported_cases') or [])}",
+                f"  - applied: {item.get('applied_case_count', 0)}, fixed: {item.get('fixed_case_count', 0)}, residual: {item.get('residual_badcase_count', 0)}, unsupported: {len(item.get('unsupported_cases') or [])}",
+                f"  - failure_categories: {format_failure_category_counts(item.get('failure_category_counts') or {})}",
+                f"  - 中文失败分类: {format_failure_category_counts_zh(item.get('failure_category_counts') or {})}",
             ]
         )
+        for unsupported in item.get("unsupported_cases") or []:
+            lines.append(
+                f"  - unsupported `{unsupported.get('id')}`: {failure_category_label_zh(unsupported.get('failure_category'))} (`{unsupported.get('failure_category') or 'unknown'}`)"
+            )
+        for failure in item.get("verification_failures") or []:
+            lines.append(
+                f"  - verification_failure `{failure.get('case_id')}` -> residual `{failure.get('residual_case_id')}`: {failure_category_label_zh(failure.get('failure_category'))} (`{failure.get('failure_category')}`)"
+            )
     lines.extend(
         [
             "",
@@ -1142,16 +1319,63 @@ def batch_fix_summary(conclusion: dict[str, Any]) -> str:
     mode_text = ", ".join(modes)
     prompt_text = "A new prompt version was created." if prompt_changed else "No new prompt version was created."
     if conclusion["residual_badcase_count"] == 0:
-        result_text = f"Fixed {conclusion['applied_case_count']} approved badcase(s)"
+        result_text = f"Verified fixed {conclusion.get('fixed_case_count', conclusion['applied_case_count'])} approved badcase(s)"
     else:
         result_text = (
-            f"Applied changes for {conclusion['applied_case_count']} approved badcase(s); "
+            f"Verified fixed {conclusion.get('fixed_case_count', 0)} approved badcase(s); "
+            f"applied changes for {conclusion['applied_case_count']} approved badcase(s); "
             f"{conclusion['residual_badcase_count']} badcase(s) remain after residual scan"
         )
     return (
         f"{result_text} across "
         f"{conclusion['file_count']} file(s). Apply mode: {mode_text}. {prompt_text}"
     )
+
+
+def format_failure_category_counts(counts: dict[str, int]) -> str:
+    if not counts:
+        return "none"
+    return ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+
+
+def format_failure_category_counts_zh(counts: dict[str, int]) -> str:
+    if not counts:
+        return "无"
+    return "，".join(
+        f"{failure_category_label_zh(key)}={value} 个"
+        for key, value in sorted(counts.items())
+    )
+
+
+def format_failure_category_lines_zh(counts: dict[str, int]) -> list[str]:
+    if not counts:
+        return ["- 无"]
+    return [
+        f"- {failure_category_label_zh(key)}（`{key}`）：{value} 个。{failure_category_description_zh(key)}"
+        for key, value in sorted(counts.items())
+    ]
+
+
+def failure_category_label_zh(category: Any) -> str:
+    labels = {
+        "fixable_by_prompt_clarification": "可通过明确 system prompt 修复",
+        "unsupported_by_missing_ground_truth": "缺少可确定修复依据",
+        "backend_failed_to_patch": "后端未生成可用 prompt patch",
+        "patch_applied_but_failed_verification": "已改动但 residual scan 未通过",
+        "likely_model_or_context_limited": "疑似模型或上下文能力限制",
+    }
+    return labels.get(str(category or "unknown"), "未知分类")
+
+
+def failure_category_description_zh(category: Any) -> str:
+    descriptions = {
+        "fixable_by_prompt_clarification": "规则方向存在，但 prompt 还不够明确、可执行或可验收。",
+        "unsupported_by_missing_ground_truth": "缺少 exact message、热线、日期、金额、工具结果或业务决策等必要信息，batch 不能自行编造。",
+        "backend_failed_to_patch": "apply 模型没有返回符合 JSON/patch contract 的可应用 prompt 修改。",
+        "patch_applied_but_failed_verification": "prompt edit 和/或 targeted rerun 已执行，但更新后的对话仍触发同类 badcase。",
+        "likely_model_or_context_limited": "只有在多轮受控实验后仍失败，且 prompt/metadata 已足够明确时才使用。",
+    }
+    return descriptions.get(str(category or "unknown"), "当前分类没有预设说明。")
 
 
 def new_batch_id(prefix: str) -> str:

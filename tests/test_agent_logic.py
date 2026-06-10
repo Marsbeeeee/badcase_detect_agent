@@ -812,6 +812,50 @@ def test_extract_json_object_escapes_raw_newlines_inside_strings() -> None:
     assert parsed["optimized_prompt"] == "Step 1: Greet.\nStep 2: Close."
 
 
+def test_repair_json_response_completes_truncated_string_and_preserves_fields() -> None:
+    content = (
+        '```json\n{"optimized_prompt":"line one\nline two",'
+        '"rationale":"patched the branch",'
+        '"applied_feedback_summary":"changed'
+    )
+
+    repair = agent_logic._repair_json_response(content)
+
+    assert repair is not None
+    parsed = json.loads(repair.repaired_json)
+    assert parsed["optimized_prompt"] == "line one\nline two"
+    assert parsed["rationale"] == "patched the branch"
+    assert parsed["applied_feedback_summary"] == "changed"
+    assert repair.original_text == content
+    assert repair.method == "complete_truncated_object"
+
+
+def test_json_repair_log_preserves_original_and_repaired_text(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(agent_logic, "PROJECT_ROOT", tmp_path)
+    repair = agent_logic.JsonRepairResult(
+        repaired_json='{"ok": true}',
+        method="unit_test",
+        original_text='model said {"ok": true',
+        repaired_text='{"ok": true}',
+    )
+
+    agent_logic._log_json_repair_attempt(
+        purpose="prompt_edit",
+        model="test-model",
+        provider="test-provider",
+        stage="initial",
+        error="bad json",
+        repair=repair,
+    )
+
+    log_path = tmp_path / "logs" / "json_repair_attempts.jsonl"
+    payload = json.loads(log_path.read_text(encoding="utf-8").strip())
+    assert payload["event"] == "json_repair_success"
+    assert payload["original_text"] == 'model said {"ok": true'
+    assert payload["repaired_text"] == '{"ok": true}'
+    assert payload["repaired_json"] == '{"ok": true}'
+
+
 def test_prompt_edit_retries_as_patch_when_full_json_is_malformed() -> None:
     old_chat_json = agent_logic._chat_json
     calls = []

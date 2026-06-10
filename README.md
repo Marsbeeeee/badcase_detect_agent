@@ -20,6 +20,11 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+```bash
+cd C:\Users\ZLSHLT2604010\Desktop\badcase_detect_agent
+.\.venv312\Scripts\streamlit.exe run app.py
+```
+
 ## Codex Skill Sync
 
 这个仓库同时保存 Codex skill 源文件：

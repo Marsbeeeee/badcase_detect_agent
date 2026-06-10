@@ -31,6 +31,12 @@ streamlit run app.py
 8. Return the required conclusion, then stop.
 9. Run `generate badcase` again only when the user explicitly wants a fresh residual scan.
 
+## Stop Directive
+
+- If the user says `停止使用 skill` or `stop skill`, stop applying this skill after acknowledging the instruction.
+- After the stop directive, do not read this skill, follow its workflow, or rely on its rules for ordinary project-code tasks.
+- Resume this skill only when the user explicitly mentions `$prompt-compliance-optimizer`, links this skill, or says to resume using the skill.
+
 ## Decision Rules
 
 - Treat this as strict system-prompt compliance, not generic answer-quality review.
@@ -77,7 +83,13 @@ Batch apply constraints:
   - `exact-message escalation`: do not use function-call-only replacement. The fix must produce the required spoken text and any required tool/action; otherwise report the case as unsupported or backend-failed.
 - Unsupported approved case types, cases whose required tool cannot be inferred, or prompt edits where the backend fails to produce an applicable in-place patch/full prompt must be reported as unsupported; do not pretend they were fixed.
 - Treat residual scan as the source of truth. If changes were applied but residual badcases remain, say "applied changes" instead of "fixed".
-- The batch conclusion is mandatory and must include aggregate counts, per-file round ids, apply mode, backend/model for prompt edits, unsupported cases, residual badcase counts, and next action.
+- The batch conclusion is mandatory and must include aggregate counts, verified fixed counts, per-file round ids, apply mode, backend/model for prompt edits, unsupported cases, verification failures, residual badcase counts, failure category counts, and next action.
+- Use these failure categories in conclusions:
+  - `fixable_by_prompt_clarification`: the intended rule exists but must be made more explicit, operational, or machine-checkable.
+  - `unsupported_by_missing_ground_truth`: required exact text, metadata, tool result, date, amount, hotline, or business decision is missing.
+  - `backend_failed_to_patch`: the apply backend did not produce an acceptable in-place patch/full prompt.
+  - `patch_applied_but_failed_verification`: prompt edit and/or rerun happened, but residual scan still found the violation.
+  - `likely_model_or_context_limited`: use only after multiple controlled experiments show failure despite clear prompt and sufficient metadata.
 
 Company model selection:
 

@@ -5,6 +5,7 @@ import os
 import re
 import difflib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +77,14 @@ class PromptOptimization:
     optimized_prompt: str
     rationale: str
     applied_feedback_summary: str
+
+
+@dataclass(frozen=True)
+class JsonRepairResult:
+    repaired_json: str
+    method: str
+    original_text: str
+    repaired_text: str
 
 
 @dataclass(frozen=True)
@@ -3224,14 +3233,48 @@ def _chat_json(settings: LLMSettings, messages: list[dict[str, str]], purpose: s
         text = _chat_text(settings=settings, messages=messages, temperature=0.1, purpose=purpose)
         try:
             return _extract_json_object(text)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as first_exc:
+            repair = _repair_json_response(text)
+            if repair is not None:
+                _log_json_repair_attempt(
+                    purpose=purpose,
+                    model=settings.model,
+                    provider=settings.provider,
+                    stage="initial",
+                    error=str(first_exc),
+                    repair=repair,
+                )
+                return repair.repaired_json
             retry_text = _chat_text(
                 settings=settings,
                 messages=_json_retry_messages(messages, text),
                 temperature=0.0,
                 purpose=f"{purpose}_json_retry",
             )
-            return _extract_json_object(retry_text)
+            try:
+                return _extract_json_object(retry_text)
+            except json.JSONDecodeError as retry_exc:
+                retry_repair = _repair_json_response(retry_text)
+                if retry_repair is not None:
+                    _log_json_repair_attempt(
+                        purpose=purpose,
+                        model=settings.model,
+                        provider=settings.provider,
+                        stage="retry",
+                        error=str(retry_exc),
+                        repair=retry_repair,
+                    )
+                    return retry_repair.repaired_json
+                _log_json_repair_failure(
+                    purpose=purpose,
+                    model=settings.model,
+                    provider=settings.provider,
+                    initial_text=text,
+                    retry_text=retry_text,
+                    initial_error=str(first_exc),
+                    retry_error=str(retry_exc),
+                )
+                raise
     client = OpenAI()
     response = client.chat.completions.create(
         model=settings.model,
@@ -3260,6 +3303,186 @@ def _json_retry_messages(
         {"role": "system", "content": retry_prompt},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
+
+
+def _repair_json_response(text: str) -> JsonRepairResult | None:
+    for method, candidate in _json_repair_candidates(text):
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return JsonRepairResult(
+                repaired_json=json.dumps(parsed, ensure_ascii=False),
+                method=method,
+                original_text=text,
+                repaired_text=candidate,
+            )
+    return None
+
+
+def _json_repair_candidates(text: str) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    stripped = _strip_markdown_json_fence(text).strip()
+    if stripped and stripped != text:
+        candidates.append(("strip_markdown_fence", stripped))
+
+    object_candidate = _best_effort_json_object_substring(stripped or text)
+    if object_candidate:
+        candidates.append(("object_substring", object_candidate))
+        escaped = _escape_json_string_control_chars(object_candidate)
+        if escaped != object_candidate:
+            candidates.append(("object_substring_escape_control_chars", escaped))
+        completed = _complete_truncated_json_object(escaped)
+        if completed != escaped:
+            candidates.append(("complete_truncated_object", completed))
+
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for method, candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append((method, candidate))
+    return unique
+
+
+def _strip_markdown_json_fence(text: str) -> str:
+    stripped = text.strip()
+    fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, flags=re.DOTALL | re.IGNORECASE)
+    if fence:
+        return fence.group(1).strip()
+    return text
+
+
+def _best_effort_json_object_substring(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    end = _last_balanced_json_object_end(text, start)
+    if end is not None:
+        return text[start:end]
+    return text[start:].strip()
+
+
+def _last_balanced_json_object_end(text: str, start: int) -> int | None:
+    depth = 0
+    in_string = False
+    escaped = False
+    last_end: int | None = None
+    for index in range(start, len(text)):
+        char = text[index]
+        if escaped:
+            escaped = False
+            continue
+        if in_string and char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth += 1
+            continue
+        if char == "}":
+            depth -= 1
+            if depth == 0:
+                last_end = index + 1
+    return last_end
+
+
+def _complete_truncated_json_object(text: str) -> str:
+    candidate = text.strip()
+    pieces = list(candidate)
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in candidate:
+        if escaped:
+            escaped = False
+            continue
+        if in_string and char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char in "{[":
+            stack.append("}" if char == "{" else "]")
+            continue
+        if char in "}]":
+            if stack and stack[-1] == char:
+                stack.pop()
+            continue
+    if in_string:
+        pieces.append('"')
+    while stack:
+        pieces.append(stack.pop())
+    return "".join(pieces)
+
+
+def _log_json_repair_attempt(
+    *,
+    purpose: str,
+    model: str,
+    provider: str,
+    stage: str,
+    error: str,
+    repair: JsonRepairResult,
+) -> None:
+    _append_json_repair_log(
+        {
+            "event": "json_repair_success",
+            "purpose": purpose,
+            "model": model,
+            "provider": provider,
+            "stage": stage,
+            "error": error,
+            "method": repair.method,
+            "original_text": repair.original_text,
+            "repaired_text": repair.repaired_text,
+            "repaired_json": repair.repaired_json,
+        }
+    )
+
+
+def _log_json_repair_failure(
+    *,
+    purpose: str,
+    model: str,
+    provider: str,
+    initial_text: str,
+    retry_text: str,
+    initial_error: str,
+    retry_error: str,
+) -> None:
+    _append_json_repair_log(
+        {
+            "event": "json_repair_failure",
+            "purpose": purpose,
+            "model": model,
+            "provider": provider,
+            "initial_error": initial_error,
+            "retry_error": retry_error,
+            "initial_text": initial_text,
+            "retry_text": retry_text,
+        }
+    )
+
+
+def _append_json_repair_log(payload: dict[str, Any]) -> None:
+    log_path = PROJECT_ROOT / "logs" / "json_repair_attempts.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"timestamp": _utc_timestamp(), **payload}, ensure_ascii=False) + "\n")
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _chat_text(

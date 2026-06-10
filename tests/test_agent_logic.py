@@ -909,6 +909,83 @@ def test_prompt_edit_retries_as_patch_when_full_json_is_malformed() -> None:
     assert calls == ["prompt_edit_patch", "prompt_edit", "prompt_edit_json_patch_retry"]
 
 
+def test_prompt_edit_rejects_truncated_full_prompt() -> None:
+    old_chat_json = agent_logic._chat_json
+    calls = []
+    current_prompt = "\n".join(
+        [
+            "# PART 1: CORE DIRECTIVES",
+            "## 1.0 Persona",
+            "Keep the caller polite.",
+            "## 2.0 Date Handling",
+            "Validate payment dates.",
+            "## 3.0 Escalation",
+            "Escalate disputes.",
+            "# PART 2: FLOW",
+            "## 1.0 Greeting",
+            "Greet the user.",
+            "## 2.0 Negotiation",
+            "Collect a proposal.",
+            "## 3.0 PTP_Closing State",
+            "Confirm accepted proposals.",
+            "## 4.0 RTP_Closing State",
+            "Close when no agreement can be reached.",
+            "## 5.0 FAQ",
+            "Answer only in scope.",
+            "Filler " * 900,
+        ]
+    )
+    truncated_prompt = "\n".join(
+        [
+            "# PART 1: CORE DIRECTIVES",
+            "## 1.0 Persona",
+            "Keep the caller polite.",
+            "## 2.0 Date Handling",
+            "Validate payment dates and route late dates to RTP_Closing.",
+        ]
+    )
+
+    def fake_chat_json(settings, messages, purpose="json"):
+        calls.append(purpose)
+        if purpose == "prompt_edit_patch":
+            return json.dumps({"replace": {"old": "missing text", "new": "replacement"}})
+        if purpose == "prompt_edit":
+            return json.dumps({"optimized_prompt": truncated_prompt})
+        if purpose == "prompt_edit_retry":
+            return json.dumps({"optimized_prompt": truncated_prompt})
+        raise AssertionError(f"unexpected purpose {purpose}")
+
+    agent_logic._chat_json = fake_chat_json
+    try:
+        data = ConversationData(
+            system_prompt=current_prompt,
+            interactions=[Interaction(role="assistant", content="bad")],
+        )
+        result = apply_recommendation_to_system_prompt(
+            data=data,
+            current_system_prompt=current_prompt,
+            bad_case=BadCase(
+                turn_index=0,
+                role="assistant",
+                error_type="late_payment_proposal_not_rtp_closing",
+                evidence="Assistant negotiated after a late date.",
+                recommendation="Route late payment dates to RTP_Closing.",
+            ),
+            llm_settings=LLMSettings(
+                backend="company_api",
+                model="m",
+                provider="p",
+                base_url="http://example.test",
+            ),
+        )
+    finally:
+        agent_logic._chat_json = old_chat_json
+
+    assert result.optimized_prompt == current_prompt
+    assert "rejected" in result.rationale
+    assert calls == ["prompt_edit_patch", "prompt_edit", "prompt_edit_retry"]
+
+
 def test_prompt_edit_retries_overlong_branch_paragraph() -> None:
     old_chat_json = agent_logic._chat_json
     calls = []

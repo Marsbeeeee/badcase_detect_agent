@@ -2080,15 +2080,44 @@ def _apply_recommendation_full_prompt(
         )
         parsed = json.loads(content)
         optimized_prompt = str(parsed.get("optimized_prompt") or current_system_prompt)
+        integrity_violation = _prompt_edit_integrity_violation(current_system_prompt, optimized_prompt)
         style_violation = _prompt_edit_style_violation(current_system_prompt, optimized_prompt)
-        if _has_step_append_violation(current_system_prompt, optimized_prompt) or style_violation:
+        if (
+            integrity_violation
+            or _has_step_append_violation(current_system_prompt, optimized_prompt)
+            or style_violation
+        ):
+            rejection_reason = (
+                integrity_violation
+                or style_violation
+                or "appended a separate note/requirements section"
+            )
             optimized_prompt = _retry_step_preserving_prompt_edit(
                 settings=settings,
                 current_system_prompt=current_system_prompt,
                 bad_case=bad_case,
                 related_turn=related_turn,
                 rejected_prompt=optimized_prompt,
-                rejection_reason=style_violation or "appended a separate note/requirements section",
+                rejection_reason=rejection_reason,
+            )
+            if optimized_prompt == current_system_prompt and integrity_violation:
+                return PromptOptimization(
+                    optimized_prompt=current_system_prompt,
+                    rationale=(
+                        f"LLM prompt edit rejected: {rejection_reason}. "
+                        "The prompt was left unchanged to avoid dropping existing workflow sections."
+                    ),
+                    applied_feedback_summary="No changes applied.",
+                )
+        integrity_violation = _prompt_edit_integrity_violation(current_system_prompt, optimized_prompt)
+        if integrity_violation:
+            return PromptOptimization(
+                optimized_prompt=current_system_prompt,
+                rationale=(
+                    f"LLM prompt edit rejected: {integrity_violation}. "
+                    "The prompt was left unchanged to avoid dropping existing workflow sections."
+                ),
+                applied_feedback_summary="No changes applied.",
             )
         return PromptOptimization(
             optimized_prompt=optimized_prompt,
@@ -2147,6 +2176,10 @@ def _retry_prompt_edit_as_patch(
         parsed = json.loads(content)
         patched_prompt = _apply_prompt_replace_patch(current_system_prompt, parsed)
         if patched_prompt is None or patched_prompt == current_system_prompt:
+            return None
+        if _prompt_edit_integrity_violation(current_system_prompt, patched_prompt):
+            return None
+        if _prompt_edit_integrity_violation(current_system_prompt, patched_prompt):
             return None
         if _has_step_append_violation(current_system_prompt, patched_prompt):
             return None
@@ -3090,6 +3123,39 @@ def _has_step_append_violation(original_prompt: str, optimized_prompt: str) -> b
     )
 
 
+def _prompt_edit_integrity_violation(original_prompt: str, optimized_prompt: str) -> str | None:
+    if not optimized_prompt.strip():
+        return "returned an empty prompt"
+
+    original_length = len(original_prompt)
+    optimized_length = len(optimized_prompt)
+    if original_length >= 4000 and optimized_length < int(original_length * 0.85):
+        return (
+            "returned a substantially shorter prompt "
+            f"({optimized_length} vs {original_length} characters)"
+        )
+
+    original_headings = _prompt_structure_headings(original_prompt)
+    if len(original_headings) >= 8:
+        missing_headings = [heading for heading in original_headings if heading not in optimized_prompt]
+        allowed_missing = max(2, len(original_headings) // 10)
+        if len(missing_headings) > allowed_missing:
+            return f"dropped existing prompt headings such as {missing_headings[0]!r}"
+
+    return None
+
+
+def _prompt_structure_headings(prompt: str) -> list[str]:
+    headings: list[str] = []
+    for line in prompt.splitlines():
+        stripped = line.strip()
+        if re.match(r"^#{1,6}\s+\S", stripped):
+            headings.append(stripped)
+        elif re.match(r"^\*\*\d+(?:\.\d+)*[^\n]*\*\*", stripped):
+            headings.append(stripped)
+    return headings
+
+
 def _prompt_edit_style_violation(original_prompt: str, optimized_prompt: str) -> str | None:
     original_lines = {line.strip() for line in original_prompt.splitlines() if line.strip()}
     for line in optimized_prompt.splitlines():
@@ -3184,6 +3250,8 @@ def _retry_step_preserving_prompt_edit(
     parsed = json.loads(content)
     retried_prompt = str(parsed.get("optimized_prompt") or current_system_prompt)
     if (
+        _prompt_edit_integrity_violation(current_system_prompt, retried_prompt)
+        or
         _has_step_append_violation(current_system_prompt, retried_prompt)
         or _prompt_edit_style_violation(current_system_prompt, retried_prompt)
     ):

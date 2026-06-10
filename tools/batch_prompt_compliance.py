@@ -23,6 +23,7 @@ from prompt_optimizer_agent.agent_logic import (  # noqa: E402
     _local_prompt_rule_bad_cases,
     analyze_bad_cases,
     apply_recommendation_to_system_prompt,
+    generate_experiment_conclusion,
     rerun_conversation,
 )
 from prompt_optimizer_agent.company_demo_client import list_company_models  # noqa: E402
@@ -329,13 +330,24 @@ def apply_file_record(
             tool_cases=tool_cases,
         )
 
-    residual_cases = [
-        bad_case_record(case)
+    residual_bad_case_objects = [
+        case
         for case in _local_prompt_rule_bad_cases(updated_data)
         if case.turn_index >= 0
     ]
+    residual_cases = [bad_case_record(case) for case in residual_bad_case_objects]
     verification_failures = build_verification_failures(applied_case_records, residual_cases)
     fixed_case_count = max(0, len(applied_case_records) - len(verification_failures))
+    rerun_result_objects = apply_meta.pop("_rerun_result_objects", [])
+    conclusion_settings = apply_meta.pop("_llm_settings", None)
+    app_conclusion = build_app_style_conclusion(
+        before_data=data,
+        updated_data=updated_data,
+        applied_case_records=applied_case_records,
+        residual_bad_case_objects=residual_bad_case_objects,
+        rerun_result_objects=rerun_result_objects,
+        llm_settings=conclusion_settings,
+    )
 
     output_path = output_dir / f"{source.stem}_updated.json"
     output_path.write_text(
@@ -362,6 +374,7 @@ def apply_file_record(
             "residual_badcases": residual_cases,
             "fixed_case_count": fixed_case_count,
             "verification_failures": verification_failures,
+            "app_conclusion": app_conclusion,
             "failure_category_counts": failure_category_counts(
                 [
                     {
@@ -427,45 +440,66 @@ def apply_prompt_cases_with_llm(
 ) -> tuple[ConversationData, list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     settings = build_apply_settings(args, data)
     working_prompt = data.system_prompt
+    current_interactions = data.interactions
     applied_case_records: list[dict[str, Any]] = []
     unsupported_cases: list[dict[str, Any]] = []
     prompt_edit_summaries: list[dict[str, str]] = []
+    rerun_results = []
+    rerun_errors: list[str] = []
+    rerun_target_turns: set[int] = set()
+    rerun_batches: list[dict[str, Any]] = []
+    total_prompt_edit_retries = 0
+    applied_prompt_cases: list[dict[str, Any]] = []
 
     for case in prompt_cases:
         bad_case = bad_case_from_record(case)
+        case_data = data.model_copy(
+            update={
+                "system_prompt": working_prompt,
+                "interactions": current_interactions,
+            }
+        )
         optimization = apply_recommendation_to_system_prompt(
-            data=data.model_copy(update={"system_prompt": working_prompt}),
+            data=case_data,
             current_system_prompt=working_prompt,
             bad_case=bad_case,
             llm_settings=settings,
         )
+        optimization, case_retry_count = retry_prompt_edit_if_unchanged_batch(
+            data=case_data,
+            current_prompt=working_prompt,
+            bad_case=bad_case,
+            llm_settings=settings,
+            optimization=optimization,
+        )
+        total_prompt_edit_retries += case_retry_count
+        prompt_changed = optimization.optimized_prompt != working_prompt
         prompt_edit_summaries.append(
             {
                 "case_id": str(case.get("id") or ""),
                 "rationale": optimization.rationale,
                 "applied_feedback_summary": optimization.applied_feedback_summary,
-                "prompt_changed": str(optimization.optimized_prompt != working_prompt),
+                "prompt_changed": str(prompt_changed),
+                "retry_count": str(case_retry_count),
             }
         )
-        if optimization.optimized_prompt == working_prompt:
-            failure_category = classify_prompt_edit_failure(
-                data=data,
-                case=case,
-                rationale=optimization.rationale,
-            )
+        if prompt_edit_backend_rejected(optimization.rationale):
             unsupported_cases.append(
                 {
                     **case,
-                    "failure_category": failure_category,
-                    "reason": (
-                        "Prompt-edit backend returned no in-place prompt change for this "
-                        "non-tool-call case."
+                    "failure_category": classify_prompt_edit_failure(
+                        data=case_data,
+                        case=case,
+                        rationale=optimization.rationale,
                     ),
+                    "reason": "Prompt-edit backend did not produce an acceptable in-place patch/full prompt.",
                     "rationale": optimization.rationale,
                 }
             )
             continue
-        working_prompt = optimization.optimized_prompt
+        if prompt_changed:
+            working_prompt = optimization.optimized_prompt
+        applied_prompt_cases.append(case)
         applied_case_records.append(
             {
                 **case,
@@ -473,40 +507,55 @@ def apply_prompt_cases_with_llm(
                 "fix_type": "prompt_edit_targeted_rerun",
                 "repair_class": "fixable_by_prompt_clarification",
                 "applied_feedback_summary": optimization.applied_feedback_summary,
+                "prompt_changed": prompt_changed,
             }
         )
 
-    prompt_changed = working_prompt != data.system_prompt
+    prompt_target_turns = rerun_targets_for_case_records(data, applied_prompt_cases)
     required_tools_by_turn = required_tools_for_case_records(data, tool_cases)
-    target_turns = rerun_targets_for_case_records(data, [*prompt_cases, *[case for case, _ in tool_cases]])
-    rerun_results = []
-    rerun_errors: list[str] = []
-    updated_interactions = data.interactions
-    if prompt_changed or required_tools_by_turn:
+    combined_target_turns = set(prompt_target_turns) | set(required_tools_by_turn)
+    if combined_target_turns:
+        rerun_data = data.model_copy(
+            update={"system_prompt": working_prompt, "interactions": current_interactions}
+        )
         rerun_results = rerun_conversation(
-            data=data.model_copy(update={"system_prompt": working_prompt}),
+            data=rerun_data,
             optimized_prompt=working_prompt,
             llm_settings=settings,
-            target_assistant_turn_indices=target_turns,
+            target_assistant_turn_indices=combined_target_turns,
             required_tools_by_turn=required_tools_by_turn,
         )
-        rerun_errors = [result.error for result in rerun_results if result.error]
-        updated_interactions = build_rerun_interactions(data, rerun_results)
-        for case, required_tool in tool_cases:
-            applied_case_records.append(
-                {
-                    **case,
-                    "applied": True,
-                    "fix_type": "llm_rerun_required_tool",
-                    "repair_class": "missing_required_tool_call",
-                    "required_tool": required_tool,
-                }
-            )
+        rerun_errors.extend(result.error for result in rerun_results if result.error)
+        rerun_target_turns.update(combined_target_turns)
+        rerun_batches.append(
+            {
+                "case_id": "selected",
+                "case_error_type": "selected_badcases",
+                "target_turns": sorted(combined_target_turns),
+                "required_tools_by_turn": {
+                    str(turn): tool for turn, tool in sorted(required_tools_by_turn.items())
+                },
+                "result_count": len(rerun_results),
+                "error_count": len([result for result in rerun_results if result.error]),
+            }
+        )
+        current_interactions = build_rerun_interactions(rerun_data, rerun_results)
+
+    for case, required_tool in tool_cases:
+        applied_case_records.append(
+            {
+                **case,
+                "applied": True,
+                "fix_type": "llm_rerun_required_tool",
+                "repair_class": "missing_required_tool_call",
+                "required_tool": required_tool,
+            }
+        )
 
     updated_data = data.model_copy(
         update={
             "system_prompt": working_prompt,
-            "interactions": updated_interactions,
+            "interactions": current_interactions,
         }
     )
     return (
@@ -519,12 +568,53 @@ def apply_prompt_cases_with_llm(
             "apply_model": settings.model,
             "apply_provider": settings.provider,
             "rerun_attempted": bool(rerun_results),
-            "rerun_target_turns": sorted(target_turns),
+            "rerun_target_turns": sorted(rerun_target_turns),
+            "rerun_batches": rerun_batches,
             "rerun_errors": rerun_errors,
             "rerun_results": [result.__dict__ for result in rerun_results],
             "prompt_edit_summaries": prompt_edit_summaries,
+            "prompt_edit_retries": total_prompt_edit_retries,
+            "_rerun_result_objects": rerun_results,
+            "_llm_settings": settings,
         },
     )
+
+
+def retry_prompt_edit_if_unchanged_batch(
+    *,
+    data: ConversationData,
+    current_prompt: str,
+    bad_case: BadCase,
+    llm_settings: LLMSettings,
+    optimization: Any,
+) -> tuple[Any, int]:
+    if optimization.optimized_prompt != current_prompt:
+        return optimization, 0
+    retry_case = BadCase(
+        turn_index=bad_case.turn_index,
+        role=bad_case.role,
+        error_type=bad_case.error_type,
+        evidence=(
+            bad_case.evidence
+            + "\n\nPrevious apply attempt returned the system prompt unchanged."
+        ),
+        recommendation=(
+            "The previous apply attempt returned the system prompt unchanged. "
+            "Make one concrete, minimal edit to the existing system prompt text so it explicitly "
+            "addresses this bad case. Do not return the identical prompt. "
+            f"Original recommendation: {bad_case.recommendation}"
+        ),
+        source=bad_case.source,
+    )
+    retry_optimization = apply_recommendation_to_system_prompt(
+        data=data,
+        current_system_prompt=current_prompt,
+        bad_case=retry_case,
+        llm_settings=llm_settings,
+    )
+    if retry_optimization.optimized_prompt == current_prompt:
+        return optimization, 1
+    return retry_optimization, 1
 
 
 def apply_result_base(
@@ -553,6 +643,43 @@ def apply_result_base(
     }
 
 
+def build_app_style_conclusion(
+    *,
+    before_data: ConversationData,
+    updated_data: ConversationData,
+    applied_case_records: list[dict[str, Any]],
+    residual_bad_case_objects: list[BadCase],
+    rerun_result_objects: list[Any],
+    llm_settings: LLMSettings | None,
+) -> str:
+    if not applied_case_records:
+        return "Conclusion skipped because no approved case was applied."
+    applied_summary = "Applied selected bad cases: " + " ".join(
+        applied.get("applied_feedback_summary")
+        or f"Applied {applied.get('source')}:{applied.get('turn_index')}:{applied.get('error_type')}."
+        for applied in applied_case_records
+    )
+    conclusion = generate_experiment_conclusion(
+        data=before_data,
+        before_prompt=before_data.system_prompt,
+        optimized_prompt=updated_data.system_prompt,
+        rerun_results=rerun_result_objects,
+        updated_interactions=updated_data.interactions,
+        post_rerun_bad_cases=residual_bad_case_objects,
+        applied_feedback_summary=applied_summary,
+        llm_settings=llm_settings,
+        post_rerun_scan_status="completed",
+    )
+    if residual_bad_case_objects:
+        residual_summary = (
+            f"Residual scan found {len(residual_bad_case_objects)} remaining badcase(s); "
+            "treat the apply cycle as not verified fixed."
+        )
+        if "successfully" in conclusion.lower() or "no further optimization is required" in conclusion.lower():
+            return residual_summary + "\n\n" + conclusion
+    return conclusion
+
+
 def classify_prompt_edit_failure(
     *,
     data: ConversationData,
@@ -564,6 +691,7 @@ def classify_prompt_edit_failure(
     lowered = rationale.lower()
     backend_failure_signals = (
         "llm prompt edit failed",
+        "llm prompt edit rejected",
         "unterminated string",
         "invalid json",
         "not valid json",
@@ -574,6 +702,11 @@ def classify_prompt_edit_failure(
     if any(signal in lowered for signal in backend_failure_signals):
         return "backend_failed_to_patch"
     return "fixable_by_prompt_clarification"
+
+
+def prompt_edit_backend_rejected(rationale: str) -> bool:
+    lowered = rationale.lower()
+    return "llm prompt edit rejected" in lowered or "llm prompt edit failed" in lowered
 
 
 def case_lacks_required_ground_truth(data: ConversationData, case: dict[str, Any]) -> bool:
@@ -1135,6 +1268,7 @@ def apply_round_event(result: dict[str, Any]) -> dict[str, Any]:
         "rerun_target_turns": result.get("rerun_target_turns", []),
         "rerun_errors": result.get("rerun_errors", []),
         "prompt_edit_summaries": result.get("prompt_edit_summaries", []),
+        "app_conclusion": result.get("app_conclusion"),
         "prompt_changed": result.get("prompt_changed", False),
         "before_hash": result.get("before_hash"),
         "after_hash": result.get("after_hash"),
@@ -1276,6 +1410,11 @@ def render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
                 f"  - 中文失败分类: {format_failure_category_counts_zh(item.get('failure_category_counts') or {})}",
             ]
         )
+        if item.get("app_conclusion"):
+            lines.append("  - app_style_conclusion:")
+            for line in str(item.get("app_conclusion") or "").splitlines():
+                if line.strip():
+                    lines.append(f"    {line}")
         for unsupported in item.get("unsupported_cases") or []:
             lines.append(
                 f"  - unsupported `{unsupported.get('id')}`: {failure_category_label_zh(unsupported.get('failure_category'))} (`{unsupported.get('failure_category') or 'unknown'}`)"

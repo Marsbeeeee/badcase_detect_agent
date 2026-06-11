@@ -13,6 +13,7 @@ from prompt_optimizer_agent.agent_logic import (
     analyze_bad_cases,
     apply_recommendation_to_system_prompt,
     _build_conclusion_payload,
+    _deterministic_experiment_conclusion,
     _normalize_ai_bad_case_turn_index,
     _parse_judge_bad_cases,
     _experiment_diagnostic_evidence,
@@ -1334,6 +1335,38 @@ def test_format_conclusion_value_splits_two_paragraph_output() -> None:
     assert paragraphs[0] == "The prompt changed Step 2.2."
     assert paragraphs[1] == "The rerun changed wording but not behavior."
     assert paragraphs[2] == "Replace the abstract instruction with concrete event benefits."
+
+
+def test_deterministic_conclusion_does_not_equate_prompt_change_with_fix() -> None:
+    conclusion = _deterministic_experiment_conclusion(
+        before_prompt="old",
+        optimized_prompt="new",
+        rerun_results=[
+            RerunTurn(
+                user_turn_index=0,
+                assistant_turn_index=1,
+                user_message="next month",
+                old_assistant_response="When can you pay?",
+                new_assistant_response="Can you pay sooner?",
+            )
+        ],
+        post_rerun_bad_cases=[
+            BadCase(
+                turn_index=1,
+                role="assistant",
+                error_type="late_payment_proposal_not_rtp_closing",
+                evidence="Still negotiated.",
+                recommendation="Close immediately.",
+            )
+        ],
+        applied_feedback_summary="Strengthened RTP_Closing.",
+        post_rerun_scan_status="completed",
+    )
+
+    paragraphs = conclusion.split("\n\n")
+    assert paragraphs[0].startswith("Not verified fixed:")
+    assert "The system prompt changed" in paragraphs[1]
+    assert "Residual badcases remain" in paragraphs[2]
 
 
 def test_experiment_diagnostic_evidence_exposes_non_surface_signals() -> None:

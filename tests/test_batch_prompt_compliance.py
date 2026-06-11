@@ -1,13 +1,251 @@
+import argparse
+import json
+
 from prompt_optimizer_agent.json_utils import ConversationData, Interaction
 from tools.batch_prompt_compliance import (
+    LATEST_APPLY_CONCLUSION_JSON,
+    LATEST_APPLY_CONCLUSION_MD,
+    LATEST_REVIEW_JSON,
+    LATEST_REVIEW_MD,
     apply_prompt_cases_with_llm,
+    build_batch_conclusion_sections,
+    build_residual_continue_review,
     build_verification_failures,
     classify_prompt_edit_failure,
     exact_responses_for_case_records,
     failure_category_counts,
     format_failure_category_counts_zh,
     required_tool_for_case,
+    render_apply_conclusion_markdown,
+    run_apply,
+    run_scan,
 )
+
+
+def test_batch_conclusion_has_three_semantic_parts_with_backend_evidence() -> None:
+    conclusion = {
+        "batch_id": "apply-one",
+        "approved_case_count": 1,
+        "applied_case_count": 1,
+        "fixed_case_count": 0,
+        "residual_badcase_count": 1,
+        "unsupported_case_count": 0,
+        "verification_failure_count": 1,
+        "failure_category_counts": {"patch_applied_but_failed_verification": 1},
+        "files": [
+            {
+                "source_file": "conversation.json",
+                "updated_file": "conversation_updated.json",
+                "scan_event_id": "scan-1",
+                "apply_event_id": "apply-1",
+                "residual_scan_event_id": "residual-1",
+                "apply_provider": "openai_api_like",
+                "apply_model": "voyager-test",
+                "prompt_changed": True,
+                "before_hash": "before",
+                "after_hash": "after",
+                "rerun_target_turns": [9],
+                "rerun_errors": [],
+                "prompt_edit_summaries": [
+                    {
+                        "case_id": "case-1",
+                        "applied_feedback_summary": "Made RTP_Closing terminal.",
+                        "rationale": "The previous branch allowed negotiation.",
+                    }
+                ],
+                "rerun_results": [
+                    {
+                        "assistant_turn_index": 9,
+                        "old_assistant_response": "When can you pay?",
+                        "new_assistant_response": "Can you pay sooner?",
+                        "error": None,
+                        "response_diagnostics": {
+                            "request_id": "request-1",
+                            "provider": "openai_api_like",
+                            "model": "voyager-test",
+                            "logprobs": {
+                                "available": True,
+                                "avg_logprob": -0.01,
+                                "min_logprob": -0.2,
+                                "low_confidence_tokens": [{"token": "sooner", "logprob": -0.2}],
+                            },
+                        },
+                    }
+                ],
+                "applied_case_count": 1,
+                "fixed_case_count": 0,
+                "residual_badcase_count": 1,
+                "residual_badcases": [{"turn_index": 9}],
+                "unsupported_cases": [],
+                "failure_category_counts": {"patch_applied_but_failed_verification": 1},
+                "verification_failures": [
+                        {
+                            "case_id": "case-1",
+                            "residual_case_id": "residual-1",
+                            "error_type": "late_payment_proposal_not_rtp_closing",
+                            "reason": "The rerun still negotiated.",
+                        "residual_evidence": "Turn 9 asked for another date.",
+                        "next_experiment": "Use deterministic backend replacement.",
+                    }
+                ],
+            }
+        ],
+    }
+
+    sections = build_batch_conclusion_sections(conclusion)
+    markdown = render_apply_conclusion_markdown(conclusion)
+
+    assert sections["verification_verdict"].startswith("Not fixed.")
+    assert "openai_api_like/voyager-test" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "request-1" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "avg=-0.01" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "does not prove compliance" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "Turn 9 asked for another date." in sections["verification_verdict"]
+    assert sections["next_action"].startswith(
+        "Primary action: Route recognized beyond-maximum-date triggers through deterministic backend RTP_Closing"
+    )
+    assert "Acceptance criteria:" in sections["next_action"]
+    assert sections["evidence"][0]["rerun_details"][0]["request_id"] == "request-1"
+    assert markdown.count("## ") == 3
+    assert "## 1. Verification Verdict" in markdown
+    assert "## 2. Badcase Diagnosis And Backend Evidence" in markdown
+    assert "## 3. Next Action" in markdown
+
+
+def test_build_residual_continue_review_uses_conclusion_next_step() -> None:
+    conclusion = {
+        "batch_id": "apply-one",
+        "approved_case_count": 1,
+        "applied_case_count": 1,
+        "fixed_case_count": 0,
+        "residual_badcase_count": 1,
+        "unsupported_case_count": 0,
+        "verification_failure_count": 1,
+        "failure_category_counts": {"patch_applied_but_failed_verification": 1},
+        "files": [
+            {
+                "source_file": "original.json",
+                "updated_file": "updated.json",
+                "residual_badcases": [
+                    {
+                        "id": "residual-1",
+                        "turn_index": 9,
+                        "role": "assistant",
+                        "error_type": "late_payment_proposal_not_rtp_closing",
+                        "evidence": "Still asks for a date.",
+                        "recommendation": "Old recommendation.",
+                    }
+                ],
+                "verification_failures": [
+                    {
+                        "case_id": "case-1",
+                        "residual_case_id": "residual-1",
+                        "error_type": "late_payment_proposal_not_rtp_closing",
+                        "next_experiment": "Use deterministic backend replacement.",
+                    }
+                ],
+            }
+        ],
+    }
+
+    review = build_residual_continue_review(conclusion, batch_id="continue-one")
+    case = review["files"][0]["badcases"][0]
+
+    assert review["mode"] == "residual_continue"
+    assert review["parent_apply_batch_id"] == "apply-one"
+    assert review["files"][0]["path"] == "updated.json"
+    assert review["files"][0]["scan_event_id"] == "continue-one-residual-review-0001"
+    assert case["parent_case_id"] == "case-1"
+    assert "Use deterministic backend replacement." in case["recommendation"]
+
+
+def test_run_scan_overwrites_latest_review_snapshot(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "conversation.json"
+    source.write_text("{}", encoding="utf-8")
+    output_dir = tmp_path / "scan"
+    log_path = tmp_path / "rounds.jsonl"
+    batches = iter(["scan-one", "scan-two"])
+
+    monkeypatch.setattr(
+        "tools.batch_prompt_compliance.scan_file",
+        lambda path, **kwargs: {
+            "path": str(path),
+            "file_name": path.name,
+            "status": "scanned",
+            "badcase_count": 0,
+            "badcases": [],
+        },
+    )
+
+    for _ in range(2):
+        args = argparse.Namespace(
+            paths=[str(source)],
+            pattern="*.json",
+            no_recursive=False,
+            judge="local",
+            model=None,
+            output_dir=str(output_dir),
+            log=str(log_path),
+            batch_id=next(batches),
+        )
+        assert run_scan(args) == 0
+
+    assert sorted(path.name for path in output_dir.iterdir()) == [
+        LATEST_REVIEW_JSON,
+        LATEST_REVIEW_MD,
+    ]
+    review = json.loads((output_dir / LATEST_REVIEW_JSON).read_text(encoding="utf-8"))
+    assert review["batch_id"] == "scan-two"
+
+
+def test_run_apply_writes_latest_snapshot_without_batch_subdirectory(tmp_path, monkeypatch) -> None:
+    review_path = tmp_path / "batch_review.json"
+    review_path.write_text(
+        json.dumps(
+            {
+                "batch_id": "scan-one",
+                "files": [
+                    {
+                        "path": str(tmp_path / "conversation.json"),
+                        "badcases": [{"id": "case-one"}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "applied"
+    log_path = tmp_path / "rounds.jsonl"
+
+    monkeypatch.setattr(
+        "tools.batch_prompt_compliance.apply_file_record",
+        lambda *args, **kwargs: {
+            "approved_case_count": 1,
+            "applied_case_count": 1,
+            "fixed_case_count": 1,
+            "unsupported_cases": [],
+            "verification_failures": [],
+            "residual_badcase_count": 0,
+        },
+    )
+    monkeypatch.setattr("tools.batch_prompt_compliance.append_round_event", lambda *args, **kwargs: None)
+
+    args = argparse.Namespace(
+        list_models=False,
+        review_json=str(review_path),
+        batch_id="apply-one",
+        output_dir=str(output_dir),
+        approve_all=True,
+        approval_file=None,
+        log=str(log_path),
+    )
+
+    assert run_apply(args) == 0
+    assert sorted(path.name for path in output_dir.iterdir()) == [
+        LATEST_APPLY_CONCLUSION_JSON,
+        LATEST_APPLY_CONCLUSION_MD,
+    ]
+    assert not (output_dir / "apply-one").exists()
 
 
 def conversation_with_transfer_tool() -> ConversationData:
@@ -130,8 +368,8 @@ def test_build_verification_failures_marks_patch_applied_but_failed() -> None:
             "residual_turn_index": 9,
             "residual_evidence": "Assistant still negotiated after rerun.",
             "next_experiment": (
-                "Strengthen the RTP_Closing rule into deterministic forbidden/required outputs, "
-                "then rerun the target turn."
+                "Route recognized beyond-maximum-date triggers through deterministic backend RTP_Closing response "
+                "replacement, then verify the target turn without another prompt-only retry."
             ),
         }
     ]

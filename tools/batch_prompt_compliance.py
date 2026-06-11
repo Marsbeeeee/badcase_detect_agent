@@ -49,6 +49,10 @@ SKIP_DIR_NAMES = {
 }
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "batch"
 DEFAULT_ROUND_LOG = PROJECT_ROOT / "logs" / "optimization_rounds.jsonl"
+LATEST_REVIEW_JSON = "batch_review.json"
+LATEST_REVIEW_MD = "batch_review.md"
+LATEST_APPLY_CONCLUSION_JSON = "batch_apply_conclusion.json"
+LATEST_APPLY_CONCLUSION_MD = "batch_apply_conclusion.md"
 
 
 def main() -> int:
@@ -57,6 +61,8 @@ def main() -> int:
         return run_scan(args)
     if args.command == "apply":
         return run_apply(args)
+    if args.command == "continue-residual":
+        return run_continue_residual(args)
     raise SystemExit(f"Unknown command: {args.command}")
 
 
@@ -72,7 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--no-recursive", action="store_true", help="Do not recurse into folders.")
     scan.add_argument("--judge", choices=["local", "company", "openai"], default="local")
     scan.add_argument("--model", default=None, help="Override model for company/openai judge.")
-    scan.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    scan.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="Directory for the latest batch_review.json/.md snapshot. Existing snapshots are overwritten.",
+    )
     scan.add_argument("--log", default=str(DEFAULT_ROUND_LOG))
     scan.add_argument("--batch-id", default=None)
 
@@ -96,9 +106,39 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--model-contains", default=None, help="Select a company model by case-insensitive substring.")
     apply.add_argument("--list-models", action="store_true", help="List company models, optionally filtered by --model-contains, then exit.")
     apply.add_argument("--max-completion-tokens", type=int, default=4096)
-    apply.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR / "applied"))
+    apply.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR / "applied"),
+        help="Directory for the latest updated files and conclusion snapshot. Existing files are overwritten.",
+    )
     apply.add_argument("--log", default=str(DEFAULT_ROUND_LOG))
     apply.add_argument("--batch-id", default=None)
+
+    cont = subparsers.add_parser(
+        "continue-residual",
+        help="Create a next-round review from residual badcases in an apply conclusion, optionally apply it.",
+    )
+    cont.add_argument("conclusion_json", help="Path to batch_apply_conclusion.json from a previous apply.")
+    cont.add_argument("--approve-all", action="store_true", help="Immediately apply every residual case.")
+    cont.add_argument(
+        "--review-output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="Directory for the next-round batch_review.json/.md snapshot.",
+    )
+    cont.add_argument(
+        "--apply-output-dir",
+        default=str(DEFAULT_OUTPUT_DIR / "applied"),
+        help="Directory for apply output when --approve-all is used.",
+    )
+    cont.add_argument("--log", default=str(DEFAULT_ROUND_LOG))
+    cont.add_argument("--batch-id", default=None)
+    cont.add_argument("--apply-backend", choices=["company", "openai"], default="company")
+    cont.add_argument("--url", default=None)
+    cont.add_argument("--provider", default=None)
+    cont.add_argument("--model", default=None)
+    cont.add_argument("--model-contains", default=None)
+    cont.add_argument("--list-models", action="store_true")
+    cont.add_argument("--max-completion-tokens", type=int, default=4096)
     return parser
 
 
@@ -131,8 +171,8 @@ def run_scan(args: argparse.Namespace) -> int:
             "notes": "Fill this list, or rerun apply with --approve-all after human review.",
         },
     }
-    review_json = output_dir / f"{batch_id}_review.json"
-    review_md = output_dir / f"{batch_id}_review.md"
+    review_json = output_dir / LATEST_REVIEW_JSON
+    review_md = output_dir / LATEST_REVIEW_MD
     review_json.write_text(json.dumps(review, ensure_ascii=False, indent=2), encoding="utf-8")
     review_md.write_text(render_review_markdown(review), encoding="utf-8")
 
@@ -163,7 +203,7 @@ def run_apply(args: argparse.Namespace) -> int:
     review_path = Path(args.review_json).expanduser()
     review = json.loads(review_path.read_text(encoding="utf-8"))
     batch_id = args.batch_id or f"{review.get('batch_id', 'batch')}-apply"
-    output_dir = Path(args.output_dir).expanduser() / batch_id
+    output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     approved_ids = load_approved_ids(args, review)
     if not approved_ids:
@@ -194,8 +234,9 @@ def run_apply(args: argparse.Namespace) -> int:
         "failure_category_counts": failure_category_counts(file_results),
         "files": file_results,
     }
-    conclusion_json = output_dir / "batch_apply_conclusion.json"
-    conclusion_md = output_dir / "batch_apply_conclusion.md"
+    conclusion["conclusion_sections"] = build_batch_conclusion_sections(conclusion)
+    conclusion_json = output_dir / LATEST_APPLY_CONCLUSION_JSON
+    conclusion_md = output_dir / LATEST_APPLY_CONCLUSION_MD
     conclusion_json.write_text(json.dumps(conclusion, ensure_ascii=False, indent=2), encoding="utf-8")
     conclusion_md.write_text(render_apply_conclusion_markdown(conclusion), encoding="utf-8")
 
@@ -218,6 +259,126 @@ def run_apply(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def run_continue_residual(args: argparse.Namespace) -> int:
+    if args.list_models:
+        print_company_model_candidates(args)
+        return 0
+
+    conclusion_path = Path(args.conclusion_json).expanduser()
+    conclusion = json.loads(conclusion_path.read_text(encoding="utf-8"))
+    batch_id = args.batch_id or f"{conclusion.get('batch_id', 'batch')}-residual-continue"
+    output_dir = Path(args.review_output_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    review = build_residual_continue_review(conclusion, batch_id=batch_id)
+
+    review_json = output_dir / LATEST_REVIEW_JSON
+    review_md = output_dir / LATEST_REVIEW_MD
+    review_json.write_text(json.dumps(review, ensure_ascii=False, indent=2), encoding="utf-8")
+    review_md.write_text(render_review_markdown(review), encoding="utf-8")
+    for file_record in review.get("files") or []:
+        append_round_event(Path(args.log).expanduser(), scan_round_event(file_record))
+
+    payload = {
+        "batch_id": batch_id,
+        "residual_case_count": review["badcase_count"],
+        "review_json": str(review_json),
+        "review_md": str(review_md),
+    }
+    if args.approve_all and review["badcase_count"]:
+        apply_args = argparse.Namespace(
+            list_models=False,
+            review_json=str(review_json),
+            approve_all=True,
+            approval_file=None,
+            apply_backend=args.apply_backend,
+            url=args.url,
+            provider=args.provider,
+            model=args.model,
+            model_contains=args.model_contains,
+            max_completion_tokens=args.max_completion_tokens,
+            output_dir=args.apply_output_dir,
+            log=args.log,
+            batch_id=f"{batch_id}-apply",
+        )
+        run_apply(apply_args)
+        payload["applied"] = True
+        payload["conclusion_json"] = str(Path(args.apply_output_dir).expanduser() / LATEST_APPLY_CONCLUSION_JSON)
+        payload["conclusion_md"] = str(Path(args.apply_output_dir).expanduser() / LATEST_APPLY_CONCLUSION_MD)
+    else:
+        payload["applied"] = False
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def build_residual_continue_review(conclusion: dict[str, Any], *, batch_id: str) -> dict[str, Any]:
+    sections = conclusion.get("conclusion_sections") or build_batch_conclusion_sections(conclusion)
+    records: list[dict[str, Any]] = []
+    for index, item in enumerate(conclusion.get("files") or [], start=1):
+        residual_cases = item.get("residual_badcases") or []
+        if not residual_cases:
+            continue
+        updated_file = str(item.get("updated_file") or item.get("source_file") or "")
+        failures_by_residual_id = {
+            str(failure.get("residual_case_id")): failure
+            for failure in item.get("verification_failures") or []
+            if failure.get("residual_case_id")
+        }
+        continued_cases = []
+        for case in residual_cases:
+            case_copy = dict(case)
+            failure = failures_by_residual_id.get(str(case_copy.get("id"))) or {}
+            next_step = str(
+                failure.get("next_experiment")
+                or sections.get("next_action")
+                or case_copy.get("recommendation")
+                or ""
+            )
+            case_copy["recommendation"] = (
+                "Continue from the previous residual conclusion. "
+                f"Next step: {next_step} "
+                "Use this as the bounded repair target; do not revisit already verified cases."
+            ).strip()
+            case_copy["parent_case_id"] = failure.get("case_id")
+            case_copy["parent_apply_batch_id"] = conclusion.get("batch_id")
+            case_copy["source"] = case_copy.get("source") or "residual_continue"
+            continued_cases.append(case_copy)
+        record = {
+            "path": updated_file,
+            "file_name": Path(updated_file).name if updated_file else str(item.get("source_file") or "unknown"),
+            "file_hash": "",
+            "status": "scanned",
+            "warnings": [
+                "Residual continuation review generated from the previous apply conclusion.",
+            ],
+            "parse_error": None,
+            "badcase_count": len(continued_cases),
+            "badcases": continued_cases,
+            "analysis_error_count": 0,
+            "analysis_errors": [],
+            "scan_event_id": f"{batch_id}-residual-review-{index:04d}",
+            "batch_id": batch_id,
+            "parent_apply_batch_id": conclusion.get("batch_id"),
+            "parent_conclusion_next_action": sections.get("next_action"),
+        }
+        records.append(record)
+    return {
+        "batch_id": batch_id,
+        "created_at": utc_timestamp(),
+        "mode": "residual_continue",
+        "judge": "residual_conclusion",
+        "input_count": len(records),
+        "file_count": len(records),
+        "badcase_count": sum(record["badcase_count"] for record in records),
+        "files": records,
+        "approval_template": {
+            "approved_case_ids": [],
+            "notes": "Approve these residual cases to continue the next repair cycle.",
+        },
+        "parent_apply_batch_id": conclusion.get("batch_id"),
+        "parent_next_action": sections.get("next_action"),
+    }
 
 
 def build_judge_settings(args: argparse.Namespace) -> LLMSettings:
@@ -793,7 +954,10 @@ def matching_residual_case(
 def next_experiment_for_failed_case(case: dict[str, Any]) -> str:
     error_type = str(case.get("error_type") or "")
     if error_type == "late_payment_proposal_not_rtp_closing":
-        return "Strengthen the RTP_Closing rule into deterministic forbidden/required outputs, then rerun the target turn."
+        return (
+            "Route recognized beyond-maximum-date triggers through deterministic backend RTP_Closing response "
+            "replacement, then verify the target turn without another prompt-only retry."
+        )
     if error_type == "escalation_action_not_followed":
         return "Extract or confirm the exact escalation message, then force deterministic spoken text plus any required action."
     return "Clarify the violated prompt rule into machine-checkable required and forbidden behavior, then rerun."
@@ -1385,7 +1549,7 @@ def render_review_markdown(review: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
+def _legacy_render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
     fix_summary = batch_fix_summary(conclusion)
     lines = [
         f"# Batch Apply Conclusion: {conclusion['batch_id']}",
@@ -1460,6 +1624,231 @@ def render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
                 if conclusion["residual_badcase_count"] == 0
                 else "Residual badcases remain and need human review."
             ),
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_batch_conclusion_sections(conclusion: dict[str, Any]) -> dict[str, Any]:
+    approved = int(conclusion.get("approved_case_count") or 0)
+    applied = int(conclusion.get("applied_case_count") or 0)
+    fixed = int(conclusion.get("fixed_case_count") or 0)
+    residual = int(conclusion.get("residual_badcase_count") or 0)
+    unsupported = int(conclusion.get("unsupported_case_count") or 0)
+    failures = int(conclusion.get("verification_failure_count") or 0)
+
+    file_evidence = [_batch_file_conclusion_evidence(item) for item in conclusion.get("files") or []]
+    fixed_turns = sorted(
+        {
+            int(case.get("turn_index"))
+            for item in conclusion.get("files") or []
+            for case in item.get("applied_cases") or []
+            if case.get("turn_index") is not None
+            and not any(
+                failure.get("case_id") == case.get("id")
+                for failure in item.get("verification_failures") or []
+            )
+        }
+    )
+    residual_turns = sorted(
+        {
+            int(case.get("turn_index"))
+            for item in conclusion.get("files") or []
+            for case in item.get("residual_badcases") or []
+            if case.get("turn_index") is not None
+        }
+    )
+
+    if residual == 0 and failures == 0 and unsupported == 0 and fixed == approved:
+        verdict = (
+            f"Verified fixed. All {approved} approved badcase(s) passed the post-apply residual scan. "
+            f"Verified turns: {fixed_turns or 'none recorded'}. Evidence: residual_badcase_count=0, "
+            f"verification_failure_count=0, unsupported_case_count=0."
+        )
+    elif fixed > 0:
+        verdict = (
+            f"Partially fixed. {fixed} of {approved} approved badcase(s) passed verification; "
+            f"{residual} residual badcase(s), {failures} verification failure(s), and {unsupported} unsupported case(s) remain. "
+            f"Verified turns: {fixed_turns or 'none recorded'}; residual turns: {residual_turns or 'none recorded'}."
+        )
+    else:
+        verdict = (
+            f"Not fixed. Changes were applied to {applied} of {approved} approved badcase(s), but verification confirmed "
+            f"{residual} residual badcase(s), {failures} verification failure(s), and {unsupported} unsupported case(s). "
+            f"Residual turns: {residual_turns or 'none recorded'}."
+        )
+    residual_evidence = [
+        _truncate_conclusion_text(str(case.get("evidence") or ""), 500)
+        for item in conclusion.get("files") or []
+        for case in item.get("residual_badcases") or []
+        if case.get("evidence")
+    ]
+    residual_evidence.extend(
+        _truncate_conclusion_text(str(failure.get("residual_evidence") or ""), 500)
+        for item in conclusion.get("files") or []
+        for failure in item.get("verification_failures") or []
+        if failure.get("residual_evidence")
+    )
+    if residual_evidence:
+        verdict += " Residual evidence: " + " | ".join(residual_evidence[:3])
+
+    diagnosis = (
+        f"Failure categories: {format_failure_category_counts(conclusion.get('failure_category_counts') or {})}. "
+        + (" ".join(evidence["diagnosis"] for evidence in file_evidence) if file_evidence else "No per-file backend evidence was recorded.")
+    )
+
+    next_experiments = [
+        next_experiment_for_failed_case(failure)
+        for item in conclusion.get("files") or []
+        for failure in item.get("verification_failures") or []
+    ]
+    if residual == 0 and failures == 0 and unsupported == 0:
+        next_action = (
+            "Primary action: keep the verified prompt/conversation version and stop. "
+            "Acceptance criteria already met: no residual badcases, no verification failures, and no unsupported cases. "
+            "Do not start another scan unless requested."
+        )
+    elif next_experiments:
+        next_action = (
+            f"Primary action: {next_experiments[0]} "
+            "Why: prompt edit and model rerun completed, but the residual scan still found the same behavior, so repeating "
+            "another prompt-only edit has weak evidence of benefit. Implementation: detect the verified trigger before "
+            "generation, replace only the affected assistant turn with the configured terminal response, preserve unrelated "
+            "turns, then run exactly one residual scan. Acceptance criteria: the target residual case disappears and adjacent "
+            "valid-date/regression cases remain unchanged. Fallback: if deterministic routing cannot be implemented safely, "
+            "mark the case unsupported and request the missing exact response or trigger ground truth."
+        )
+    elif unsupported:
+        next_action = "Supply the missing ground truth for unsupported cases, then rebuild the Repair Plan before Apply."
+    else:
+        next_action = "Review the residual evidence and run one bounded experiment that targets the recorded failure category."
+
+    return {
+        "verification_verdict": verdict,
+        "badcase_diagnosis_and_backend_evidence": diagnosis,
+        "next_action": next_action,
+        "evidence": file_evidence,
+    }
+
+
+def _batch_file_conclusion_evidence(item: dict[str, Any]) -> dict[str, Any]:
+    reruns = item.get("rerun_results") or []
+    prompt_edits = item.get("prompt_edit_summaries") or []
+    residual_cases = item.get("residual_badcases") or []
+    rerun_details = []
+    for result in reruns:
+        diagnostics = result.get("response_diagnostics") if isinstance(result, dict) else None
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        logprobs = diagnostics.get("logprobs") if isinstance(diagnostics.get("logprobs"), dict) else {}
+        rerun_details.append(
+            {
+                "turn": result.get("assistant_turn_index"),
+                "old_response": _truncate_conclusion_text(str(result.get("old_assistant_response") or ""), 350),
+                "new_response": _truncate_conclusion_text(str(result.get("new_assistant_response") or ""), 500),
+                "error": result.get("error"),
+                "request_id": diagnostics.get("request_id"),
+                "provider": diagnostics.get("provider"),
+                "model": diagnostics.get("model"),
+                "logprobs_available": logprobs.get("available") is True,
+                "avg_logprob": logprobs.get("avg_logprob"),
+                "min_logprob": logprobs.get("min_logprob"),
+                "low_confidence_tokens": [
+                    {
+                        "token": token.get("token"),
+                        "logprob": token.get("logprob"),
+                    }
+                    for token in (logprobs.get("low_confidence_tokens") or [])[:5]
+                    if isinstance(token, dict)
+                ],
+            }
+        )
+    logprob_available = [detail for detail in rerun_details if detail["logprobs_available"]]
+    if logprob_available:
+        logprob_summary = (
+            "Logprobs were available for rerun output. "
+            + "; ".join(
+                f"turn {detail['turn']}: avg={detail['avg_logprob']}, min={detail['min_logprob']}, "
+                f"low_confidence_tokens={detail['low_confidence_tokens']}"
+                for detail in logprob_available
+            )
+            + ". High confidence only means the backend strongly preferred its output; it does not prove compliance."
+        )
+    else:
+        logprob_summary = "No usable logprob evidence was attached; do not attribute the failure to token uncertainty."
+
+    residual_summary = " | ".join(
+        f"turn {case.get('turn_index')} {case.get('error_type')}: {_truncate_conclusion_text(str(case.get('evidence') or ''), 450)}"
+        for case in residual_cases
+    ) or "none"
+    patch_summary = " | ".join(
+        f"case {edit.get('case_id')}: {edit.get('applied_feedback_summary')}; rationale={edit.get('rationale')}"
+        for edit in prompt_edits
+    ) or "none"
+    diagnosis = (
+        f"{Path(str(item.get('source_file') or 'unknown')).name}: the residual scan is the correctness evidence "
+        f"(residual={item.get('residual_badcase_count', 0)}, residual evidence={residual_summary}). "
+        f"Prompt/backend evidence: backend={item.get('apply_provider') or 'unknown'}/{item.get('apply_model') or 'unknown'}, "
+        f"prompt_changed={bool(item.get('prompt_changed'))}, prompt_hash={item.get('before_hash') or '-'}->{item.get('after_hash') or '-'}, "
+        f"prompt edits={patch_summary}. Rerun evidence: targets={item.get('rerun_target_turns') or []}, "
+        f"errors={item.get('rerun_errors') or []}, responses={rerun_details}. {logprob_summary}"
+    )
+    return {
+        "source_file": item.get("source_file"),
+        "diagnosis": diagnosis,
+        "rerun_details": rerun_details,
+        "prompt_edit_summaries": prompt_edits,
+        "residual_badcases": residual_cases,
+        "logprob_summary": logprob_summary,
+    }
+
+
+def _truncate_conclusion_text(text: str, limit: int) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit].rstrip() + "..."
+
+
+def render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
+    sections = conclusion.get("conclusion_sections") or build_batch_conclusion_sections(conclusion)
+    lines = [
+        f"# Batch Apply Conclusion: {conclusion['batch_id']}",
+        "",
+        "## 1. Verification Verdict",
+        "",
+        str(sections["verification_verdict"]),
+        "",
+        "## 2. Badcase Diagnosis And Backend Evidence",
+        "",
+        str(sections["badcase_diagnosis_and_backend_evidence"]),
+        "",
+    ]
+    for item in conclusion.get("files") or []:
+        lines.extend(
+            [
+                f"- `{item.get('source_file')}`",
+                f"  - updated_file: `{item.get('updated_file')}`",
+                f"  - scan/apply/residual: `{item.get('scan_event_id')}` / `{item.get('apply_event_id')}` / `{item.get('residual_scan_event_id')}`",
+                f"  - backend: `{item.get('apply_provider') or 'unknown'}` / `{item.get('apply_model') or 'unknown'}`",
+                f"  - prompt: changed=`{item.get('prompt_changed', False)}`, hash `{item.get('before_hash') or '-'}` -> `{item.get('after_hash') or '-'}`",
+                f"  - rerun_target_turns: {', '.join(str(turn) for turn in item.get('rerun_target_turns') or []) or 'none'}",
+                f"  - rerun_errors: {len(item.get('rerun_errors') or [])}",
+                f"  - applied: {item.get('applied_case_count', 0)}, fixed: {item.get('fixed_case_count', 0)}, residual: {item.get('residual_badcase_count', 0)}, unsupported: {len(item.get('unsupported_cases') or [])}",
+                f"  - failure_categories: {format_failure_category_counts(item.get('failure_category_counts') or {})}",
+            ]
+        )
+        for failure in item.get("verification_failures") or []:
+            lines.append(
+                f"  - verification_failure `{failure.get('case_id')}` -> residual `{failure.get('residual_case_id')}`: "
+                f"{failure.get('reason') or failure.get('failure_category')}; evidence: {failure.get('residual_evidence') or 'none'}"
+            )
+    lines.extend(
+        [
+            "",
+            "## 3. Next Action",
+            "",
+            str(sections["next_action"]),
             "",
         ]
     )

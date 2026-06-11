@@ -2700,17 +2700,21 @@ def generate_experiment_conclusion(
         '{"conclusion":{"paragraph_1":"...","paragraph_2":"...","paragraph_3":"..."}}. '
         "Each value must be one short paragraph. Do not include headings, bullets, numbered labels, or markdown lists. "
         "Keep all three paragraphs together under 180 words.\n\n"
-        "paragraph_1 must summarize the exact previous prompt/rule change using paragraph_inputs.paragraph_1_changes. "
-        "If paragraph_inputs.paragraph_1_changes.prompt_changed is false, state that no new system-prompt version "
-        "was made and that the target conversation turn was rerun with the existing prompt; do not describe that as "
-        "a failed or skipped experiment. Mention concrete changed rule text or duplicated/weak edit quality when present.\n\n"
-        "paragraph_2 must evaluate whether the bad case was actually improved using "
-        "paragraph_inputs.paragraph_2_improvement_evidence. Do not claim the response is identical when "
+        "paragraph_1 must give the verification verdict: state whether the approved badcase was actually fixed, "
+        "partially fixed, or not fixed. Base the verdict on residual scan results and target-turn behavior, not on "
+        "whether a prompt edit or rerun merely executed.\n\n"
+        "paragraph_2 must diagnose why the badcase passed or failed and connect that diagnosis to prompt-change and "
+        "backend evidence using paragraph_inputs.paragraph_2_improvement_evidence and "
+        "paragraph_inputs.paragraph_1_changes. Mention the concrete violated behavior, whether the prompt changed, "
+        "and available rerun/tool/token/backend metadata. Do not claim the response is identical when "
         "target_turn_comparisons says only wording changed; instead say wording changed but target behavior did or did "
         "not improve. Use token/logprob evidence only when token_probability.available is true. If it is false, say "
-        "there is no token-probability evidence and use behavior/meta/tool evidence.\n\n"
-        "paragraph_3 must give one actionable next optimization using paragraph_inputs.paragraph_3_next_recommendation. "
-        "Tie it to the observed root cause and avoid generic advice."
+        "there is no token-probability evidence and use behavior/meta/tool evidence. High-confidence logprobs on a "
+        "wrong response mean the backend strongly preferred the wrong behavior; they do not prove compliance.\n\n"
+        "paragraph_3 must give the single best next action for the current verified state using "
+        "paragraph_inputs.paragraph_3_next_recommendation. If verification passed, say to keep the version and stop. "
+        "If it failed, tie the action to the observed root cause and backend evidence. Include why, implementation "
+        "steps, acceptance criteria, and a fallback; avoid generic advice or repeating an unchanged failed experiment."
     )
     payload = _build_conclusion_payload(
         data=data,
@@ -2784,15 +2788,23 @@ def _deterministic_experiment_conclusion(
         for result in rerun_results
     )
     residual_count = len(post_rerun_bad_cases)
-    first = (
-        f"The working system prompt was updated: {applied_feedback_summary}"
+    if post_rerun_scan_status != "completed":
+        first = "Verification is incomplete because the post-rerun badcase scan did not complete."
+    elif residual_count == 0:
+        first = f"Verified fixed: target assistant turn(s) {', '.join(target_turns) or '-'} have no residual badcases."
+    else:
+        first = (
+            f"Not verified fixed: the post-rerun scan still found {residual_count} residual badcase(s) "
+            f"on target assistant turn(s) {', '.join(target_turns) or '-'}."
+        )
+    prompt_evidence = (
+        f"The system prompt changed: {applied_feedback_summary}"
         if prompt_changed
-        else "No new system-prompt version was created; the selected target turn was rerun with the existing prompt."
+        else "No new system-prompt version was created; the target turn was rerun with the existing prompt."
     )
     second = (
-        f"Target assistant turn(s) {', '.join(target_turns) or '-'} were rerun; "
-        f"token-probability evidence was {'available' if logprob_available else 'not available'}. "
-        f"The post-rerun scan status was {post_rerun_scan_status} with {residual_count} residual badcase(s)."
+        f"{prompt_evidence} Token-probability evidence was {'available' if logprob_available else 'not available'}; "
+        "the residual scan is the verification source of truth."
     )
     third = (
         "The cycle is complete; keep this prompt version and do not run another scan unless requested."
@@ -2864,9 +2876,9 @@ def _build_conclusion_payload(
         "output_contract": {
             "format": {
                 "conclusion": {
-                    "paragraph_1": "exact prompt/rule change",
-                    "paragraph_2": "improvement verdict with deeper evidence",
-                    "paragraph_3": "actionable next optimization",
+                    "paragraph_1": "verification verdict: whether it was actually fixed",
+                    "paragraph_2": "badcase diagnosis connected to prompt and backend evidence",
+                    "paragraph_3": "best next action for the verified state",
                 }
             },
             "constraints": [

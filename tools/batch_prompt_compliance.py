@@ -902,7 +902,7 @@ def prompt_has_exact_message_ground_truth(system_prompt: str) -> bool:
     if not any(phrase in prompt for phrase in ("message exactly", "say exactly", "deliver the following message exactly")):
         return False
     quoted_exact_message = re.search(
-        r"(?:message exactly|say exactly|deliver the following message exactly)\s*[:：]?\s*[\"“][^\"”]{20,}[\"”]",
+        r"(?:message exactly|say exactly|deliver the following message exactly)\s*[:锛歖?\s*[\"鈥淽[^\"鈥漖{20,}[\"鈥漖",
         system_prompt,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -1580,16 +1580,16 @@ def _legacy_render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
         "",
         f"Failure categories: {format_failure_category_counts(conclusion.get('failure_category_counts') or {})}",
         "",
-        "## 中文摘要",
+        "## 涓枃鎽樿",
         "",
-        f"- 人工确认的 badcase：{conclusion['approved_case_count']} 个",
-        f"- 已尝试应用改动：{conclusion['applied_case_count']} 个",
-        f"- 已通过 residual scan 验证修复：{conclusion.get('fixed_case_count', 0)} 个",
-        f"- 未能自动应用改动：{conclusion['unsupported_case_count']} 个",
-        f"- 已改动但验收失败：{conclusion.get('verification_failure_count', 0)} 个",
-        f"- residual scan 仍剩余：{conclusion['residual_badcase_count']} 个",
+        f"- 浜哄伐纭鐨?badcase锛歿conclusion['approved_case_count']} 涓?,
+        f"- 宸插皾璇曞簲鐢ㄦ敼鍔細{conclusion['applied_case_count']} 涓?,
+        f"- 宸查€氳繃 residual scan 楠岃瘉淇锛歿conclusion.get('fixed_case_count', 0)} 涓?,
+        f"- 鏈兘鑷姩搴旂敤鏀瑰姩锛歿conclusion['unsupported_case_count']} 涓?,
+        f"- 宸叉敼鍔ㄤ絾楠屾敹澶辫触锛歿conclusion.get('verification_failure_count', 0)} 涓?,
+        f"- residual scan 浠嶅墿浣欙細{conclusion['residual_badcase_count']} 涓?,
         "",
-        "失败分类：",
+        "澶辫触鍒嗙被锛?,
         "",
         *format_failure_category_lines_zh(conclusion.get("failure_category_counts") or {}),
         "",
@@ -1610,7 +1610,7 @@ def _legacy_render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
                 f"  - required_tools: {', '.join(item.get('required_tools') or []) or 'none'}",
                 f"  - applied: {item.get('applied_case_count', 0)}, fixed: {item.get('fixed_case_count', 0)}, residual: {item.get('residual_badcase_count', 0)}, unsupported: {len(item.get('unsupported_cases') or [])}",
                 f"  - failure_categories: {format_failure_category_counts(item.get('failure_category_counts') or {})}",
-                f"  - 中文失败分类: {format_failure_category_counts_zh(item.get('failure_category_counts') or {})}",
+                f"  - 涓枃澶辫触鍒嗙被: {format_failure_category_counts_zh(item.get('failure_category_counts') or {})}",
             ]
         )
         if item.get("app_conclusion"):
@@ -1907,42 +1907,42 @@ def format_failure_category_counts(counts: dict[str, int]) -> str:
 
 def format_failure_category_counts_zh(counts: dict[str, int]) -> str:
     if not counts:
-        return "无"
-    return "，".join(
-        f"{failure_category_label_zh(key)}={value} 个"
+        return "鏃?
+    return "锛?.join(
+        f"{failure_category_label_zh(key)}={value} 涓?
         for key, value in sorted(counts.items())
     )
 
 
 def format_failure_category_lines_zh(counts: dict[str, int]) -> list[str]:
     if not counts:
-        return ["- 无"]
+        return ["- 鏃?]
     return [
-        f"- {failure_category_label_zh(key)}（`{key}`）：{value} 个。{failure_category_description_zh(key)}"
+        f"- {failure_category_label_zh(key)}锛坄{key}`锛夛細{value} 涓€倇failure_category_description_zh(key)}"
         for key, value in sorted(counts.items())
     ]
 
 
 def failure_category_label_zh(category: Any) -> str:
     labels = {
-        "fixable_by_prompt_clarification": "可通过明确 system prompt 修复",
-        "unsupported_by_missing_ground_truth": "缺少可确定修复依据",
-        "backend_failed_to_patch": "后端未生成可用 prompt patch",
-        "patch_applied_but_failed_verification": "已改动但 residual scan 未通过",
-        "likely_model_or_context_limited": "疑似模型或上下文能力限制",
+        "fixable_by_prompt_clarification": "鍙€氳繃鏄庣‘ system prompt 淇",
+        "unsupported_by_missing_ground_truth": "缂哄皯鍙‘瀹氫慨澶嶄緷鎹?,
+        "backend_failed_to_patch": "鍚庣鏈敓鎴愬彲鐢?prompt patch",
+        "patch_applied_but_failed_verification": "宸叉敼鍔ㄤ絾 residual scan 鏈€氳繃",
+        "likely_model_or_context_limited": "鐤戜技妯″瀷鎴栦笂涓嬫枃鑳藉姏闄愬埗",
     }
-    return labels.get(str(category or "unknown"), "未知分类")
+    return labels.get(str(category or "unknown"), "鏈煡鍒嗙被")
 
 
 def failure_category_description_zh(category: Any) -> str:
     descriptions = {
-        "fixable_by_prompt_clarification": "规则方向存在，但 prompt 还不够明确、可执行或可验收。",
-        "unsupported_by_missing_ground_truth": "缺少 exact message、热线、日期、金额、工具结果或业务决策等必要信息，batch 不能自行编造。",
-        "backend_failed_to_patch": "apply 模型没有返回符合 JSON/patch contract 的可应用 prompt 修改。",
-        "patch_applied_but_failed_verification": "prompt edit 和/或 targeted rerun 已执行，但更新后的对话仍触发同类 badcase。",
-        "likely_model_or_context_limited": "只有在多轮受控实验后仍失败，且 prompt/metadata 已足够明确时才使用。",
+        "fixable_by_prompt_clarification": "瑙勫垯鏂瑰悜瀛樺湪锛屼絾 prompt 杩樹笉澶熸槑纭€佸彲鎵ц鎴栧彲楠屾敹銆?,
+        "unsupported_by_missing_ground_truth": "缂哄皯 exact message銆佺儹绾裤€佹棩鏈熴€侀噾棰濄€佸伐鍏风粨鏋滄垨涓氬姟鍐崇瓥绛夊繀瑕佷俊鎭紝batch 涓嶈兘鑷缂栭€犮€?,
+        "backend_failed_to_patch": "apply 妯″瀷娌℃湁杩斿洖绗﹀悎 JSON/patch contract 鐨勫彲搴旂敤 prompt 淇敼銆?,
+        "patch_applied_but_failed_verification": "prompt edit 鍜?鎴?targeted rerun 宸叉墽琛岋紝浣嗘洿鏂板悗鐨勫璇濅粛瑙﹀彂鍚岀被 badcase銆?,
+        "likely_model_or_context_limited": "鍙湁鍦ㄥ杞彈鎺у疄楠屽悗浠嶅け璐ワ紝涓?prompt/metadata 宸茶冻澶熸槑纭椂鎵嶄娇鐢ㄣ€?,
     }
-    return descriptions.get(str(category or "unknown"), "当前分类没有预设说明。")
+    return descriptions.get(str(category or "unknown"), "褰撳墠鍒嗙被娌℃湁棰勮璇存槑銆?)
 
 
 def new_batch_id(prefix: str) -> str:

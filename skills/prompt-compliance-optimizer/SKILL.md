@@ -26,10 +26,11 @@ streamlit run app.py
 3. Click or run `generate badcase` to produce Trace List items.
 4. Check whether each trace comes from `Original` or `Updated` conversation and keep the right-side conversation view aligned with the trace source.
 5. Present candidate badcases for human review and stop before applying fixes.
-6. After the user approves specific badcases, decide whether Apply should edit the prompt, rerun the target turn, or both.
-7. After Apply, verify the Updated Conversation, inserted tool turns, prompt diff, residual scan result, and Round History records.
-8. Return the required conclusion, then stop.
-9. Run `generate badcase` again only when the user explicitly wants a fresh residual scan.
+6. After the user approves specific badcases, produce a Repair Plan with `Root-cause`, `Patch target`, and `Verification cases` for every approved case.
+7. Use the Repair Plan to decide whether Apply should edit the prompt, rerun the target turn, or both.
+8. After Apply, verify the Updated Conversation, inserted tool turns, prompt diff, residual scan result, and Round History records.
+9. Return the required conclusion, then stop.
+10. Run `generate badcase` again only when the user explicitly wants a fresh residual scan.
 
 ## Stop Directive
 
@@ -46,6 +47,54 @@ streamlit run app.py
 - Do not treat exact-message escalation as a tool-call-only fix. If the violated rule requires exact spoken text, hotline wording, or a configured escalation message, the updated assistant turn must contain that required text and any required tool/action.
 - If rerun creates a function call, expect a placeholder `Tool` turn with `status: not_executed`; the app does not execute real tools locally.
 - If the prompt changed, expect a new prompt version and a diff. If the prompt did not change but rerun succeeded, describe it as a conversation-only rerun, not as a failed prompt edit.
+
+## Repair Plan Rules
+
+Before applying approved badcases, produce a Repair Plan. Do not apply prompt edits or reruns until every approved case has a complete `Root-cause`, `Patch target`, and `Verification cases` entry.
+
+`Root-cause` must explain why the assistant could plausibly violate the system prompt, not merely restate that it violated the rule. Include:
+
+- `case_id`, turn, file, and failure type.
+- The violated rule or workflow branch.
+- The trigger condition in the user turn.
+- The observed wrong assistant behavior.
+- One root-cause category:
+  - `missing_branch`: the prompt lacks the required branch.
+  - `weak_branch_priority`: the branch exists but can be overridden by another flow.
+  - `missing_forbidden_behavior`: the prompt does not forbid the observed wrong action.
+  - `missing_exact_message`: the prompt requires exact text but does not make it operational enough.
+  - `ambiguous_trigger`: the trigger is unclear or underspecified.
+  - `tool_rule_underbound`: the required tool, timing, or arguments are unclear.
+  - `ground_truth_missing`: required date, amount, hotline, metadata, tool result, or business decision is missing.
+- A concise root-cause sentence tied to the current system prompt.
+
+`Patch target` must constrain the repair to the smallest prompt or rerun surface that can fix the approved case. Include:
+
+- `section_hint`: the prompt section, branch, or policy area to edit.
+- `operation`: one of `add_missing_branch`, `strengthen_existing_branch`, `strengthen_branch_priority`, `add_forbidden_behavior`, `strengthen_exact_action`, `clarify_tool_rule`, or `conversation_only_rerun`.
+- `required_change`: the specific rule/action that must be added or strengthened.
+- `must_include`: required behaviors, exact text requirements, tool call requirements, priority rules, or terminal-routing language.
+- `must_not_change`: neighboring flows that must remain intact.
+- `apply_mode`: `prompt edit`, `conversation-only rerun`, or `both`.
+
+`Verification cases` must show how the repair will be proven and bounded. Include at least:
+
+- One `positive` case from the approved badcase turn or an equivalent turn that must now pass.
+- One `negative` case where the new rule must not trigger.
+- One `regression` case for an adjacent branch, priority rule, exact-message rule, or tool-call rule that must remain unchanged.
+
+If any of the three parts cannot be completed because the prompt or metadata lacks necessary ground truth, report the case as `unsupported_by_missing_ground_truth` and stop before Apply for that case.
+
+The Repair Plan is not a request for the human to manually edit the system prompt. Its purpose is to constrain autonomous repair. After a case is approved, the backend must attempt to produce and apply the prompt change itself.
+
+Autonomous prompt repair should use this fallback ladder:
+
+1. `exact_patch`: apply an exact in-place replacement when the original substring can be located safely.
+2. `anchored_section_patch`: if exact replacement fails, locate the target section or branch from `section_hint` and insert or rewrite only that bounded section.
+3. `bounded_full_prompt_rewrite`: if section anchoring fails but the full prompt is available, generate a complete updated prompt that preserves unrelated content and changes only the `Patch target` intent.
+4. `conversation_only_rerun`: use only when the current prompt already contains the rule and the Repair Plan says no prompt edit is needed.
+
+Do not hand off failed prompt edits to the human as manual prompt-writing work. If every autonomous repair strategy fails, report `backend_failed_to_autonomously_repair`, include the failed strategy names and backend/model details, and stop with residual badcases for review.
 
 ## Human Review Rules
 
@@ -70,10 +119,11 @@ Batch scan workflow:
 Batch apply workflow:
 
 1. Continue only after the user approves all files, selected files, or selected case ids.
-2. Run `tools/batch_prompt_compliance.py apply <batch_review.json>` with either `--approve-all` or an approval file.
-3. Write one updated output file per input file.
-4. Record per-file apply and residual scan rounds.
-5. Return one aggregate conclusion plus per-file conclusion details.
+2. Produce a Repair Plan for every approved case and mark unsupported cases before Apply.
+3. Run `tools/batch_prompt_compliance.py apply <batch_review.json>` with either `--approve-all` or an approval file.
+4. Write one updated output file per input file.
+5. Record per-file apply and residual scan rounds.
+6. Return one aggregate conclusion plus per-file conclusion details.
 
 Batch apply constraints:
 
@@ -81,19 +131,22 @@ Batch apply constraints:
   - `missing-required-tool-call`: use deterministic conversation-only required-tool replacement only when the required tool can be inferred from the current file's tool definitions and no exact spoken message is required.
   - `prompt-flow violation`: use LLM prompt edit, then targeted rerun of the affected assistant turn(s), then residual scan.
   - `exact-message escalation`: do not use function-call-only replacement. The fix must produce the required spoken text and any required tool/action; otherwise report the case as unsupported or backend-failed.
+- Batch apply must use the Repair Plan to bound prompt edits. Do not make broad prompt rewrites when the approved cases point to a specific branch, priority rule, forbidden behavior, exact message, or tool-call rule.
+- Batch apply must attempt the autonomous prompt repair fallback ladder before giving up on an approved prompt-edit case. Do not require a human to manually author the system prompt patch.
 - Unsupported approved case types, cases whose required tool cannot be inferred, or prompt edits where the backend fails to produce an applicable in-place patch/full prompt must be reported as unsupported; do not pretend they were fixed.
 - Treat residual scan as the source of truth. If changes were applied but residual badcases remain, say "applied changes" instead of "fixed".
-- The batch conclusion is mandatory and must include aggregate counts, verified fixed counts, per-file round ids, apply mode, backend/model for prompt edits, unsupported cases, verification failures, residual badcase counts, failure category counts, and next action.
+- The batch conclusion is mandatory and must include aggregate counts, verified fixed counts, per-file round ids, apply mode, Repair Plan coverage, backend/model for prompt edits, unsupported cases, verification failures, residual badcase counts, failure category counts, and next action.
 - Use these failure categories in conclusions:
   - `fixable_by_prompt_clarification`: the intended rule exists but must be made more explicit, operational, or machine-checkable.
   - `unsupported_by_missing_ground_truth`: required exact text, metadata, tool result, date, amount, hotline, or business decision is missing.
   - `backend_failed_to_patch`: the apply backend did not produce an acceptable in-place patch/full prompt.
+  - `backend_failed_to_autonomously_repair`: all autonomous prompt repair strategies failed.
   - `patch_applied_but_failed_verification`: prompt edit and/or rerun happened, but residual scan still found the violation.
   - `likely_model_or_context_limited`: use only after multiple controlled experiments show failure despite clear prompt and sufficient metadata.
 
 Company model selection:
 
-- Default to the configured H200 company model; do not ask the user to choose a model unless they request it or the default model fails.
+- Default to the configured Voyager company model; do not ask the user to choose a model unless they request it or the default model fails.
 - When the user wants alternatives, run `tools/batch_prompt_compliance.py apply --list-models --model-contains <keyword>` to show rough matches.
 - If applying with a rough match, use `--model-contains <keyword>` only when it matches exactly one company model. If multiple models match, show the candidate list and stop for user selection.
 

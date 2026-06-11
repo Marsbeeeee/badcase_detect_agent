@@ -66,7 +66,7 @@ export PROMPT_OPTIMIZER_MODEL="gpt-4o-mini"
 ```bash
 export COMPANY_LLM_URL="http://192.168.101.15:9898"
 export COMPANY_LLM_PROVIDER="openai_api_like"
-export COMPANY_LLM_MODEL="H200_01_fc_9010"
+export COMPANY_LLM_MODEL="voyager-1.6-preview-run27m4a8b4-r3"
 ```
 
 ## Supported Data

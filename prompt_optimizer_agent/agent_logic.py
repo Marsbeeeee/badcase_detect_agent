@@ -4,7 +4,7 @@ import json
 import os
 import re
 import difflib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,7 +23,7 @@ from prompt_optimizer_agent.json_utils import ConversationData, Interaction, ren
 DEFAULT_MODEL = os.getenv("PROMPT_OPTIMIZER_MODEL", "gpt-4o-mini")
 DEFAULT_COMPANY_URL = os.getenv("COMPANY_LLM_URL", "http://192.168.101.15:9898")
 DEFAULT_COMPANY_PROVIDER = os.getenv("COMPANY_LLM_PROVIDER", "openai_api_like")
-DEFAULT_COMPANY_MODEL = os.getenv("COMPANY_LLM_MODEL", "H200_01_fc_9010")
+DEFAULT_COMPANY_MODEL = os.getenv("COMPANY_LLM_MODEL", "voyager-1.6-preview-run27m4a8b4-r3")
 AUTO_RERUN_CONTEXT_WINDOW = -1
 AUTO_RERUN_CONTEXT_CHAR_BUDGET = 12000
 AUTO_RERUN_CONTEXT_MIN_MESSAGES = 6
@@ -942,7 +942,7 @@ def _local_late_payment_proposal_cases(data: ConversationData) -> list[BadCase]:
             continue
         user_index = pending_late_user_index
         pending_late_user_index = None
-        if _assistant_moves_to_rtp_closing(turn.content):
+        if _assistant_moves_to_rtp_closing(turn.content, data.system_prompt):
             continue
         cases.append(
             BadCase(
@@ -987,10 +987,12 @@ def _user_proposes_late_payment_date(text: str) -> bool:
     )
 
 
-def _assistant_moves_to_rtp_closing(text: str) -> bool:
+def _assistant_moves_to_rtp_closing(text: str, system_prompt: str = "") -> bool:
     lowered = _compact_text(text).lower()
     if _assistant_asks_question(text):
         return False
+    if _looks_like_final_rtp_closing(text, system_prompt):
+        return True
     if _asks_open_ended_payment_terms(text):
         return False
     return any(
@@ -1010,6 +1012,115 @@ def _assistant_moves_to_rtp_closing(text: str) -> bool:
             "后续致电",
         )
     )
+
+
+def _looks_like_final_rtp_closing(text: str, system_prompt: str = "") -> bool:
+    lowered = _compact_text(text).lower()
+    if "<dialog-end>" not in lowered:
+        return False
+    has_deadline = _contains_date_or_deadline_reference(lowered, system_prompt)
+    has_payment_requirement = any(
+        term in lowered
+        for term in (
+            "payment",
+            "pay",
+            "repay",
+            "pembayaran",
+            "bayar",
+            "melunasi",
+            "tunggakan",
+            "rupiah",
+            "还款",
+            "付款",
+        )
+    )
+    has_consequence = any(
+        term in lowered
+        for term in (
+            "additional fee",
+            "late fee",
+            "payment history",
+            "account status",
+            "follow-up",
+            "collection",
+            "legal",
+            "denda tambahan",
+            "biaya tambahan",
+            "riwayat kredit",
+            "status akun",
+            "penagihan lebih lanjut",
+            "follow-up calls",
+            "panggilan lanjutan",
+        )
+    )
+    return has_deadline and has_payment_requirement and has_consequence
+
+
+def _contains_date_or_deadline_reference(response_lowered: str, system_prompt: str = "") -> bool:
+    if any(marker in response_lowered for marker in ("deadline", "paling lambat", "latest date", "due date")):
+        return True
+    if _contains_calendar_date(response_lowered):
+        return True
+    for marker in _prompt_date_markers(system_prompt):
+        if marker and marker in response_lowered:
+            return True
+    return False
+
+
+def _contains_calendar_date(text_lowered: str) -> bool:
+    month_names = (
+        "jan",
+        "january",
+        "januari",
+        "feb",
+        "february",
+        "februari",
+        "mar",
+        "march",
+        "maret",
+        "apr",
+        "april",
+        "may",
+        "mei",
+        "jun",
+        "june",
+        "juni",
+        "jul",
+        "july",
+        "juli",
+        "aug",
+        "august",
+        "agustus",
+        "sep",
+        "september",
+        "oct",
+        "october",
+        "oktober",
+        "nov",
+        "november",
+        "dec",
+        "december",
+        "desember",
+    )
+    month_pattern = "|".join(re.escape(month) for month in month_names)
+    return bool(
+        re.search(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", text_lowered)
+        or re.search(rf"\b\d{{1,2}}\s+(?:{month_pattern})\w*\s+20\d{{2}}\b", text_lowered)
+        or re.search(rf"\b(?:{month_pattern})\w*\s+\d{{1,2}},?\s+20\d{{2}}\b", text_lowered)
+    )
+
+
+def _prompt_date_markers(system_prompt: str) -> set[str]:
+    markers: set[str] = set()
+    lowered = system_prompt.lower()
+    markers.update(re.findall(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", lowered))
+    for match in re.finditer(
+        r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s+"
+        r"([a-z]+\s+\d{1,2},?\s+20\d{2})\b",
+        lowered,
+    ):
+        markers.add(re.sub(r"\s+", " ", match.group(1)).strip())
+    return markers
 
 
 def _prompt_requires_concrete_payment_fallback(system_prompt: str) -> bool:
@@ -1923,6 +2034,7 @@ def apply_recommendation_to_system_prompt(
     current_system_prompt: str,
     bad_case: BadCase,
     llm_settings: LLMSettings | None = None,
+    force_prompt_edit: bool = False,
 ) -> PromptOptimization:
     settings = llm_settings or LLMSettings()
     recommendation = bad_case.recommendation.strip() or _recommendation_from_bad_case(bad_case)
@@ -1935,6 +2047,14 @@ def apply_recommendation_to_system_prompt(
                 "step-preserving edits require an LLM to rewrite the relevant numbered step in place."
             ),
             applied_feedback_summary="No changes applied.",
+        )
+
+    already_addresses_case = _prompt_already_addresses_case(current_system_prompt, bad_case)
+    if already_addresses_case and not force_prompt_edit:
+        return PromptOptimization(
+            optimized_prompt=current_system_prompt,
+            rationale=already_addresses_case,
+            applied_feedback_summary="No new prompt change was needed; the working prompt already covers this bad case.",
         )
 
     turn = (
@@ -1957,12 +2077,29 @@ def apply_recommendation_to_system_prompt(
     )
     if patch_optimization is not None and patch_optimization.optimized_prompt != current_system_prompt:
         return patch_optimization
-    return _apply_recommendation_full_prompt(
+    patch_retry = _retry_prompt_edit_as_patch(
         settings=settings,
         current_system_prompt=current_system_prompt,
         bad_case=bad_case,
-        related_turn=turn,
         payload=payload,
+        failure_reason="Initial exact replacement patch was missing, unchanged, invalid, or did not match the current prompt.",
+    )
+    if patch_retry is not None:
+        return patch_retry
+    deterministic_patch = _deterministic_prompt_patch(
+        current_system_prompt,
+        bad_case,
+        force_prompt_edit=force_prompt_edit,
+    )
+    if deterministic_patch is not None:
+        return deterministic_patch
+    return PromptOptimization(
+        optimized_prompt=current_system_prompt,
+        rationale=(
+            "LLM prompt edit failed: the backend did not return an applicable exact replacement patch. "
+            "The prompt was left unchanged because Apply only supports local in-place prompt patches."
+        ),
+        applied_feedback_summary="No changes applied.",
     )
 
 
@@ -2014,6 +2151,12 @@ def _apply_recommendation_patch_to_system_prompt(
         if _has_step_append_violation(current_system_prompt, patched_prompt):
             return None
         if _prompt_edit_style_violation(current_system_prompt, patched_prompt):
+            return None
+        if _prompt_patch_relevance_violation(
+            current_system_prompt,
+            patched_prompt,
+            payload.get("bad_case"),
+        ):
             return None
         return PromptOptimization(
             optimized_prompt=patched_prompt,
@@ -2152,7 +2295,7 @@ def _retry_prompt_edit_as_patch(
     failure_reason: str,
 ) -> PromptOptimization | None:
     retry_prompt = (
-        "The previous full-prompt edit failed because the model did not return parseable JSON. "
+        "The previous prompt patch attempt failed or did not apply cleanly. "
         "Do not return the full prompt. Return exactly one small JSON object containing an exact "
         "replacement patch with keys replace, rationale, and applied_feedback_summary. "
         "replace.old must be copied exactly from current_system_prompt as one contiguous substring. "
@@ -2162,7 +2305,7 @@ def _retry_prompt_edit_as_patch(
     )
     retry_payload = {
         **payload,
-        "failed_full_prompt_edit_reason": failure_reason,
+        "failed_patch_reason": failure_reason,
     }
     try:
         content = _chat_json(
@@ -2185,6 +2328,12 @@ def _retry_prompt_edit_as_patch(
             return None
         if _prompt_edit_style_violation(current_system_prompt, patched_prompt):
             return None
+        if _prompt_patch_relevance_violation(
+            current_system_prompt,
+            patched_prompt,
+            payload.get("bad_case"),
+        ):
+            return None
         return PromptOptimization(
             optimized_prompt=patched_prompt,
             rationale=str(parsed.get("rationale") or "Applied JSON repair patch retry."),
@@ -2202,6 +2351,7 @@ def rerun_conversation(
     llm_settings: LLMSettings | None = None,
     target_assistant_turn_indices: set[int] | None = None,
     required_tools_by_turn: dict[int, str] | None = None,
+    required_exact_responses_by_turn: dict[int, str] | None = None,
     expected_system_prompt_hash: str | None = None,
     expected_prompt_version: str | None = None,
 ) -> list[RerunTurn]:
@@ -2215,6 +2365,7 @@ def rerun_conversation(
             index for index, turn in enumerate(data.interactions) if turn.role == "assistant"
         }
     required_tools_by_turn = required_tools_by_turn or {}
+    required_exact_responses_by_turn = required_exact_responses_by_turn or {}
 
     if not _has_llm_access(settings):
         return [
@@ -2253,7 +2404,12 @@ def rerun_conversation(
                     settings.rerun_context_window_turns,
                 )
                 required_tool = required_tools_by_turn.get(index)
+                required_exact_response = required_exact_responses_by_turn.get(index)
                 request_messages = _with_required_tool_instruction(request_messages, required_tool)
+                request_messages = _with_required_exact_response_instruction(
+                    request_messages,
+                    required_exact_response,
+                )
                 tool_choice = _tool_choice_for_required_tool(required_tool, data.tools)
                 _preflight_company_rerun_request(
                     settings=settings,
@@ -2325,7 +2481,12 @@ def rerun_conversation(
                 settings.rerun_context_window_turns,
             )
             required_tool = required_tools_by_turn.get(-1)
+            required_exact_response = required_exact_responses_by_turn.get(-1)
             request_messages = _with_required_tool_instruction(request_messages, required_tool)
+            request_messages = _with_required_exact_response_instruction(
+                request_messages,
+                required_exact_response,
+            )
             tool_choice = _tool_choice_for_required_tool(required_tool, data.tools)
             _preflight_company_rerun_request(
                 settings=settings,
@@ -2411,6 +2572,20 @@ def _with_required_tool_instruction(
         "For the next assistant turn, you MUST call the function/tool "
         f"`{required_tool}`. Do not answer in natural language before this tool call. "
         "Use the latest customer message and relevant immediate context to populate the arguments."
+    )
+    return [*messages, {"role": "system", "content": instruction}]
+
+
+def _with_required_exact_response_instruction(
+    messages: list[dict[str, str]],
+    required_response: str | None,
+) -> list[dict[str, str]]:
+    if not required_response:
+        return messages
+    instruction = (
+        "For the next assistant turn, an exact spoken escalation action is required. "
+        "Return exactly this text, with no extra words, no translation, no question, and no tool call:\n"
+        f"{required_response}"
     )
     return [*messages, {"role": "system", "content": instruction}]
 
@@ -2547,21 +2722,84 @@ def generate_experiment_conclusion(
         applied_feedback_summary=applied_feedback_summary,
         post_rerun_scan_status=post_rerun_scan_status,
     )
+    payload_json = json.dumps(payload, ensure_ascii=False)
+    if len(payload_json) > 45000:
+        return _deterministic_experiment_conclusion(
+            before_prompt=before_prompt,
+            optimized_prompt=optimized_prompt,
+            rerun_results=rerun_results,
+            post_rerun_bad_cases=post_rerun_bad_cases,
+            applied_feedback_summary=applied_feedback_summary,
+            post_rerun_scan_status=post_rerun_scan_status,
+        )
     messages = [
         {"role": "system", "content": conclusion_prompt},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        {"role": "user", "content": payload_json},
     ]
     _write_conclusion_dialog_log(messages)
     try:
+        conclusion_settings = replace(
+            settings,
+            max_completion_tokens=min(settings.max_completion_tokens, 1024),
+        )
         content = _chat_json(
-            settings=settings,
+            settings=conclusion_settings,
             messages=messages,
             purpose="conclusion",
         )
         parsed = json.loads(content)
         return _format_conclusion_value(parsed.get("conclusion"))
     except (OpenAIError, requests.RequestException, RuntimeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        if "maximum context length" in str(exc).lower() or "input_tokens" in str(exc).lower():
+            return _deterministic_experiment_conclusion(
+                before_prompt=before_prompt,
+                optimized_prompt=optimized_prompt,
+                rerun_results=rerun_results,
+                post_rerun_bad_cases=post_rerun_bad_cases,
+                applied_feedback_summary=applied_feedback_summary,
+                post_rerun_scan_status=post_rerun_scan_status,
+            )
         return f"Conclusion generation failed: {exc}"
+
+
+def _deterministic_experiment_conclusion(
+    *,
+    before_prompt: str,
+    optimized_prompt: str,
+    rerun_results: list[RerunTurn],
+    post_rerun_bad_cases: list[BadCase],
+    applied_feedback_summary: str,
+    post_rerun_scan_status: str,
+) -> str:
+    prompt_changed = before_prompt.strip() != optimized_prompt.strip()
+    target_turns = [
+        str(result.assistant_turn_index)
+        for result in rerun_results
+        if result.assistant_turn_index is not None
+    ]
+    logprob_available = any(
+        isinstance(result.response_diagnostics, dict)
+        and isinstance(result.response_diagnostics.get("logprobs"), dict)
+        and result.response_diagnostics["logprobs"].get("available") is True
+        for result in rerun_results
+    )
+    residual_count = len(post_rerun_bad_cases)
+    first = (
+        f"The working system prompt was updated: {applied_feedback_summary}"
+        if prompt_changed
+        else "No new system-prompt version was created; the selected target turn was rerun with the existing prompt."
+    )
+    second = (
+        f"Target assistant turn(s) {', '.join(target_turns) or '-'} were rerun; "
+        f"token-probability evidence was {'available' if logprob_available else 'not available'}. "
+        f"The post-rerun scan status was {post_rerun_scan_status} with {residual_count} residual badcase(s)."
+    )
+    third = (
+        "The cycle is complete; keep this prompt version and do not run another scan unless requested."
+        if residual_count == 0
+        else "Residual badcases remain; review the remaining traces before applying another targeted prompt patch."
+    )
+    return "\n\n".join([first, second, third])
 
 
 def _write_conclusion_dialog_log(
@@ -2679,17 +2917,41 @@ def _build_conclusion_payload(
             },
         },
         "raw_evidence": {
-            "before_prompt": before_prompt,
-            "optimized_prompt": optimized_prompt,
+            "before_prompt_preview": _truncate_for_conclusion(before_prompt),
+            "optimized_prompt_preview": _truncate_for_conclusion(optimized_prompt),
             "prompt_diff": prompt_diff,
             "source_meta": data.source_meta,
-            "tools": data.tools,
-            "original_interactions": [turn.model_dump(exclude_none=True) for turn in data.interactions],
-            "updated_interactions": [turn.model_dump(exclude_none=True) for turn in updated_interactions],
-            "rerun_evidence": rerun_evidence,
-            "rerun_results": [_rerun_result_dict(result) for result in rerun_results],
+            "tool_names": sorted(str(key) for key in (data.tools or {}).keys()),
+            "original_turn_count": len(data.interactions),
+            "updated_turn_count": len(updated_interactions),
+            "rerun_results": [_rerun_result_summary(result) for result in rerun_results],
             "post_rerun_bad_cases": [case.__dict__ for case in post_rerun_bad_cases],
         },
+    }
+
+
+def _truncate_for_conclusion(text: str, limit: int = 5000) -> str:
+    if len(text) <= limit:
+        return text
+    head = max(0, limit // 2)
+    tail = max(0, limit - head)
+    return (
+        text[:head]
+        + f"\n...[truncated {len(text) - limit} characters for conclusion payload]...\n"
+        + text[-tail:]
+    )
+
+
+def _rerun_result_summary(result: RerunTurn) -> dict[str, object]:
+    diagnostics = result.response_diagnostics or {}
+    logprobs = diagnostics.get("logprobs") if isinstance(diagnostics, dict) else None
+    return {
+        "user_turn_index": result.user_turn_index,
+        "assistant_turn_index": result.assistant_turn_index,
+        "old_assistant_response_preview": _truncate_for_conclusion(result.old_assistant_response, limit=1200),
+        "new_assistant_response_preview": _truncate_for_conclusion(result.new_assistant_response, limit=1200),
+        "error": result.error,
+        "logprobs": logprobs,
     }
 
 
@@ -3121,6 +3383,415 @@ def _has_step_append_violation(original_prompt: str, optimized_prompt: str) -> b
         section in optimized_lower and section not in original_lower
         for section in forbidden_sections
     )
+
+
+def _prompt_patch_relevance_violation(
+    original_prompt: str,
+    optimized_prompt: str,
+    bad_case: Any,
+) -> str | None:
+    error_type = _bad_case_error_type(bad_case)
+    changed_text = _changed_prompt_text(original_prompt, optimized_prompt).lower()
+    if error_type == "escalation_action_not_followed" and _bad_case_mentions_exact_message(bad_case):
+        required_markers = (
+            "exact",
+            "message exactly",
+            "hotline",
+            "required message",
+            "spoken text",
+            "configured escalation action",
+        )
+        if any(marker in changed_text for marker in required_markers):
+            return None
+        return "patch did not edit the exact escalation/action conflict"
+    if error_type != "late_payment_proposal_not_rtp_closing":
+        return None
+    required_markers = (
+        "rtp_closing",
+        "maximum payment date",
+        "payment date",
+        "date validation",
+        "later than",
+        "after the maximum",
+        "deadline",
+        "do not negotiate",
+        "not negotiate",
+        "late-date",
+        "late date",
+    )
+    if any(marker in changed_text for marker in required_markers):
+        return None
+    return "patch did not edit the late-date/RTP_Closing rule"
+
+
+def _bad_case_error_type(bad_case: Any) -> str:
+    if isinstance(bad_case, BadCase):
+        return bad_case.error_type
+    if isinstance(bad_case, dict):
+        return str(bad_case.get("error_type") or "")
+    return ""
+
+
+def _bad_case_mentions_exact_message(bad_case: Any) -> bool:
+    if isinstance(bad_case, BadCase):
+        text = " ".join((bad_case.error_type, bad_case.evidence, bad_case.recommendation))
+    elif isinstance(bad_case, dict):
+        text = " ".join(
+            str(bad_case.get(key) or "")
+            for key in ("error_type", "evidence", "recommendation")
+        )
+    else:
+        text = str(bad_case or "")
+    lowered = text.lower()
+    return "exact" in lowered and (
+        "message" in lowered
+        or "spoken text" in lowered
+        or "escalation action" in lowered
+        or "hotline" in lowered
+    )
+
+
+def _changed_prompt_text(original_prompt: str, optimized_prompt: str) -> str:
+    changed_lines = []
+    for line in difflib.ndiff(original_prompt.splitlines(), optimized_prompt.splitlines()):
+        if line.startswith("+ ") or line.startswith("- "):
+            changed_lines.append(line[2:])
+    return "\n".join(changed_lines)
+
+
+def _deterministic_prompt_patch(
+    current_system_prompt: str,
+    bad_case: BadCase,
+    force_prompt_edit: bool = False,
+) -> PromptOptimization | None:
+    if bad_case.error_type == "escalation_action_not_followed":
+        return _deterministic_exact_escalation_prompt_patch(current_system_prompt, bad_case)
+    if bad_case.error_type == "late_payment_proposal_not_rtp_closing":
+        return _deterministic_late_date_prompt_patch(
+            current_system_prompt,
+            force_prompt_edit=force_prompt_edit,
+        )
+    return None
+
+
+def _deterministic_late_date_prompt_patch(
+    current_system_prompt: str,
+    force_prompt_edit: bool = False,
+) -> PromptOptimization | None:
+    if "Rule conflict resolver for late-date proposals:" in current_system_prompt:
+        if force_prompt_edit:
+            return _reinforce_existing_late_date_resolver(current_system_prompt)
+        return None
+    date_section = _find_late_date_validation_section(current_system_prompt)
+    if date_section is None:
+        return None
+    proposal_section = _find_proposal_collection_section(current_system_prompt)
+    closing_section = _find_rtp_closing_section(current_system_prompt)
+    insertions: list[tuple[int, str]] = []
+    insertions.append((date_section.end, _late_date_validation_conflict_guard()))
+    if proposal_section is not None:
+        insertions.append((proposal_section.end, _proposal_clarification_conflict_guard()))
+    if closing_section is not None:
+        insertions.append((closing_section.end, _rtp_closing_conflict_guard()))
+    patched_prompt = _apply_prompt_insertions(current_system_prompt, insertions)
+    return PromptOptimization(
+        optimized_prompt=patched_prompt,
+        rationale=(
+            "Applied deterministic local rule-conflict patch to the existing late-date, proposal "
+            "clarification, and RTP_Closing branches using only values already configured in the "
+            "current prompt."
+        ),
+        applied_feedback_summary=(
+            "Added generic rule-conflict guards so late-date routing to RTP_Closing takes priority "
+            "over proposal clarification, negotiation, and commitment questions."
+        ),
+    )
+
+
+def _reinforce_existing_late_date_resolver(current_system_prompt: str) -> PromptOptimization | None:
+    marker = "Residual-verification reinforcement for late-date proposals:"
+    if marker in current_system_prompt:
+        return None
+    resolver = _find_named_rule_block(
+        current_system_prompt,
+        "Rule conflict resolver for late-date proposals:",
+    )
+    if resolver is None:
+        return None
+    reinforcement = (
+        "\n\nResidual-verification reinforcement for late-date proposals:\n"
+        "- A late-date proposal is a deterministic terminal-routing condition. Once detected, do not "
+        "generate any content from proposal collection, negotiation, persuasion, deadline-adjustment, "
+        "or payment-commitment flows.\n"
+        "- The response may only acknowledge the user's stated timing, state that the late proposal "
+        "cannot be accepted, deliver the configured RTP_Closing assertions, and end with `<dialog-end>`.\n"
+        "- Forbidden outputs include suggesting payment before the deadline, asking the user to try, "
+        "asking whether payment is possible, offering another date, or ending with any question."
+    )
+    patched_prompt = (
+        current_system_prompt[: resolver.end]
+        + reinforcement
+        + current_system_prompt[resolver.end :]
+    )
+    return PromptOptimization(
+        optimized_prompt=patched_prompt,
+        rationale=(
+            "Strengthened the existing late-date resolver after an unchanged or failed-verification "
+            "apply attempt by adding deterministic allowed and forbidden output constraints."
+        ),
+        applied_feedback_summary=(
+            "Reinforced the existing late-date resolver with a deterministic terminal-response contract."
+        ),
+    )
+
+
+def _find_named_rule_block(system_prompt: str, heading: str) -> _PromptSection | None:
+    start = system_prompt.find(heading)
+    if start < 0:
+        return None
+    next_block = re.search(r"\n\n[A-Z][^\n]{3,120}:\n", system_prompt[start + len(heading) :])
+    end = (
+        start + len(heading) + next_block.start()
+        if next_block
+        else len(system_prompt)
+    )
+    return _PromptSection(start=start, end=end)
+
+
+@dataclass(frozen=True)
+class _PromptSection:
+    start: int
+    end: int
+
+
+def _find_late_date_validation_section(system_prompt: str) -> _PromptSection | None:
+    heading_match = re.search(
+        r"\*\*[^*\n]*(?:maximum payment date validation|date validation)[^*\n]*\*\*:?",
+        system_prompt,
+        flags=re.IGNORECASE,
+    )
+    if heading_match:
+        next_heading = re.search(
+            r"\n(?:\*\*\d+(?:\.\d+)*[^*\n]*\*\*:?|#{1,6}\s+\S)",
+            system_prompt[heading_match.end() :],
+            flags=re.IGNORECASE,
+        )
+        end = heading_match.end() + next_heading.start() if next_heading else len(system_prompt)
+        section_text = system_prompt[heading_match.start() : end].lower()
+        if "rtp_closing" in section_text and (
+            "later than" in section_text
+            or "maximum payment date" in section_text
+            or ">" in section_text
+        ):
+            return _PromptSection(heading_match.start(), end)
+
+    branch_match = re.search(
+        r"if\s+the\s+user\s+proposes\s+a\s+payment\s+date.{0,1800}?rtp_closing.{0,800}?(?=\n\n|\Z)",
+        system_prompt,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if branch_match:
+        return _PromptSection(branch_match.start(), branch_match.end())
+    return None
+
+
+def _find_proposal_collection_section(system_prompt: str) -> _PromptSection | None:
+    heading_pattern = re.compile(
+        r"(?m)^(?:\*\*[^*\n]*(?:clarify|collect|proposal|payment proposal)[^*\n]*\*\*:?|"
+        r"#{1,6}\s+[^\n]*(?:clarify|collect|proposal)[^\n]*)",
+        flags=re.IGNORECASE,
+    )
+    for heading_match in heading_pattern.finditer(system_prompt):
+        next_heading = re.search(
+            r"\n(?:\*\*\d+(?:\.\d+)*[^*\n]*\*\*:?|#{1,6}\s+\S)",
+            system_prompt[heading_match.end() :],
+            flags=re.IGNORECASE,
+        )
+        end = heading_match.end() + next_heading.start() if next_heading else len(system_prompt)
+        section_text = system_prompt[heading_match.start() : end].lower()
+        if _looks_like_proposal_clarification_section(section_text):
+            return _PromptSection(heading_match.start(), end)
+
+    branch_match = re.search(
+        r"(?:if\s+the\s+user\s+[^.\n]{0,260}?(?:does\s+not\s+mention\s+a\s+date|vague\s+date)"
+        r"[^.\n]{0,260}?(?:ask|prompt)[^.\n]{0,120}?date)",
+        system_prompt,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if branch_match:
+        return _PromptSection(branch_match.start(), branch_match.end())
+    return None
+
+
+def _find_rtp_closing_section(system_prompt: str) -> _PromptSection | None:
+    heading_match = re.search(
+        r"(?m)^(?:\*\*[^*\n]*rtp_closing[^*\n]*\*\*:?|#{1,6}\s+[^\n]*rtp_closing[^\n]*)",
+        system_prompt,
+        flags=re.IGNORECASE,
+    )
+    if not heading_match:
+        return None
+    next_heading = re.search(
+        r"\n(?:\*\*\d+(?:\.\d+)*[^*\n]*\*\*:?|#{1,6}\s+\S)",
+        system_prompt[heading_match.end() :],
+        flags=re.IGNORECASE,
+    )
+    end = heading_match.end() + next_heading.start() if next_heading else len(system_prompt)
+    return _PromptSection(heading_match.start(), end)
+
+
+def _looks_like_proposal_clarification_section(section_text: str) -> bool:
+    has_proposal_language = any(
+        term in section_text
+        for term in (
+            "proposal",
+            "payment date",
+            "clarify",
+            "collect",
+            "ask the user when",
+            "prompt the user for a date",
+        )
+    )
+    has_date_language = "date" in section_text or "tanggal" in section_text
+    asks_for_more = any(term in section_text for term in ("ask", "prompt", "clarify", "collect"))
+    return has_proposal_language and has_date_language and asks_for_more
+
+
+def _late_date_validation_conflict_guard() -> str:
+    return (
+        "\n\nRule conflict resolver for late-date proposals:\n"
+        "- This date-validation branch has priority over proposal clarification, negotiation, "
+        "validation-tool calls, and payment-commitment questions whenever the user's timing is "
+        "later than the configured maximum payment date.\n"
+        "- Treat any user payment timing that can be resolved to later than the configured maximum "
+        "payment date as terminal for negotiation, including relative or natural-language timing "
+        "resolved from the prompt's reference date.\n"
+        "- The next assistant response must follow the configured RTP_Closing state only. Use the "
+        "amount, deadline, consequences, payment channels, and closing wording already defined in "
+        "the current system prompt and RTP_Closing section.\n"
+        "- Do not negotiate, ask for another date, ask for commitment or confirmation, call validation "
+        "tools, or include any follow-up question before closing. The response must be a final closing "
+        "response with `<dialog-end>` and must not contain a question mark or interrogative sentence."
+    )
+
+
+def _proposal_clarification_conflict_guard() -> str:
+    return (
+        "\n\nRule conflict resolver before proposal clarification:\n"
+        "- Before this section asks for missing, vague, relative, or more specific payment-date details, "
+        "first apply any higher-priority date-validation rule in the current system prompt.\n"
+        "- If the user's timing already gives enough information to determine that it is later than "
+        "the configured maximum payment date, do not clarify, negotiate, ask for commitment, or ask "
+        "whether the user can pay by the configured maximum date.\n"
+        "- In that conflict, skip this clarification flow and route the next assistant response directly "
+        "to the configured RTP_Closing state as a final `<dialog-end>` closing response."
+    )
+
+
+def _rtp_closing_conflict_guard() -> str:
+    return (
+        "\n\nRule conflict resolver inside RTP_Closing:\n"
+        "- When RTP_Closing is reached from a late-date, maximum-date, no-agreement, or failed-negotiation "
+        "route, the response is terminal and must be a closing statement, not a new negotiation turn.\n"
+        "- State the configured payment requirement and consequences as assertions using the values already "
+        "defined in this prompt. Do not ask whether the customer can commit, can try, can consider, or can "
+        "make payment by the deadline.\n"
+        "- End with the configured polite closing and `<dialog-end>`. Do not include any question mark or "
+        "interrogative sentence."
+    )
+
+
+def _apply_prompt_insertions(prompt: str, insertions: list[tuple[int, str]]) -> str:
+    patched = prompt
+    for position, text in sorted(insertions, key=lambda item: item[0], reverse=True):
+        if text.strip() in patched:
+            continue
+        patched = patched[:position] + text + patched[position:]
+    return patched
+
+
+def _deterministic_exact_escalation_prompt_patch(
+    current_system_prompt: str,
+    bad_case: BadCase,
+) -> PromptOptimization | None:
+    if not _bad_case_mentions_exact_message(bad_case):
+        return None
+    exact_message = extract_exact_escalation_message(current_system_prompt)
+    if not exact_message:
+        return None
+    if "Operational guard for exact escalation actions:" in current_system_prompt:
+        return None
+    match = re.search(
+        r"When an escalation is triggered, you must \*\*immediately stop\*\*.*?"
+        r"deliver the following message exactly [\"“].*?[\"”]\.",
+        current_system_prompt,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    action_text = match.group(0)
+    guard = (
+        "\n\nOperational guard for exact escalation actions:\n"
+        "- This escalation action has the highest priority over negotiation, payment confirmation, "
+        "ordinary call closure, and transfer branches.\n"
+        "- If the latest user message matches any configured escalation trigger, including a debt "
+        "dispute or already-paid claim when those triggers are defined, execute this exact escalation "
+        "action immediately.\n"
+        "- The next assistant response must be exactly: "
+        f"\"{exact_message}\"\n"
+        "- Do not ask for additional details, proof, confirmation, dates, payment method, or whether "
+        "the user wants to speak with an agent. Do not continue negotiation. "
+        "Do not call a transfer tool unless the exact message itself requires a tool call."
+    )
+    patched_prompt = current_system_prompt.replace(action_text, action_text + guard, 1)
+    already_paid_anchor = (
+        "    - If the user informs that they have already paid, thank the user for the payment "
+        "and end the call <dialog-end>."
+    )
+    if already_paid_anchor in patched_prompt:
+        patched_prompt = patched_prompt.replace(
+            already_paid_anchor,
+            (
+                "    - If the user informs that they have already paid, first check the configured "
+                "Escalation Triggers. If the current prompt classifies the statement as an escalation "
+                "trigger, execute the configured Escalation Action exactly. Only use the thank-and-end "
+                "behavior when the statement is not an escalation trigger."
+            ),
+            1,
+        )
+    return PromptOptimization(
+        optimized_prompt=patched_prompt,
+        rationale=(
+            "Applied deterministic local patch to make exact escalation action highest priority "
+            "and resolve the already-paid branch conflict."
+        ),
+        applied_feedback_summary=(
+            "Added an operational guard for exact escalation actions and clarified that already-paid "
+            "claims route to the configured escalation action."
+        ),
+    )
+
+
+def extract_exact_escalation_message(system_prompt: str) -> str | None:
+    match = re.search(
+        r"deliver the following message exactly\s*[:：]?\s*[\"“](?P<message>.*?)[\"”]",
+        system_prompt,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    message = re.sub(r"\s+", " ", match.group("message")).strip()
+    return message or None
+
+
+def _prompt_already_addresses_case(current_system_prompt: str, bad_case: BadCase) -> str | None:
+    if bad_case.error_type == "escalation_action_not_followed":
+        if "Operational guard for exact escalation actions:" in current_system_prompt:
+            return "Existing working prompt already contains the exact-escalation operational guard."
+    if bad_case.error_type == "late_payment_proposal_not_rtp_closing":
+        if "Rule conflict resolver for late-date proposals:" in current_system_prompt:
+            return "Existing working prompt already contains the late-date rule-conflict resolver."
+    return None
 
 
 def _prompt_edit_integrity_violation(original_prompt: str, optimized_prompt: str) -> str | None:

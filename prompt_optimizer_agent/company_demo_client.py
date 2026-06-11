@@ -494,7 +494,7 @@ def _response_logprob_diagnostics(
             diagnostics["logprobs"]["reason"] = "Logprobs were not requested for this request purpose."
         return diagnostics
 
-    content_logprobs = logprobs.get("content") if isinstance(logprobs, dict) else None
+    content_logprobs = _logprob_content_rows(logprobs)
     if not isinstance(content_logprobs, list):
         diagnostics["logprobs"]["available"] = False
         diagnostics["logprobs"]["reason"] = "choices[0].logprobs did not include a content token list."
@@ -521,6 +521,9 @@ def _response_logprob_diagnostics(
 def _extract_choice_logprobs(data: Any) -> Any:
     if not isinstance(data, dict):
         return None
+    direct_logprobs = data.get("logprobs")
+    if direct_logprobs:
+        return direct_logprobs
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         return None
@@ -528,6 +531,15 @@ def _extract_choice_logprobs(data: Any) -> Any:
     if not isinstance(first, dict):
         return None
     return first.get("logprobs")
+
+
+def _logprob_content_rows(logprobs: Any) -> list[Any] | None:
+    if isinstance(logprobs, dict):
+        content = logprobs.get("content")
+        return content if isinstance(content, list) else None
+    if isinstance(logprobs, list):
+        return logprobs
+    return None
 
 
 def _low_confidence_token_samples(token_rows: list[dict[str, Any]], limit: int = 12) -> list[dict[str, Any]]:

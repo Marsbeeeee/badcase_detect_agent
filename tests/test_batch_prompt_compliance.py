@@ -3,6 +3,7 @@ from tools.batch_prompt_compliance import (
     apply_prompt_cases_with_llm,
     build_verification_failures,
     classify_prompt_edit_failure,
+    exact_responses_for_case_records,
     failure_category_counts,
     format_failure_category_counts_zh,
     required_tool_for_case,
@@ -37,6 +38,31 @@ def test_required_tool_for_case_ignores_exact_message_escalation() -> None:
     }
 
     assert required_tool_for_case(conversation_with_transfer_tool(), case) is None
+
+
+def test_exact_responses_for_case_records_maps_escalation_turn() -> None:
+    exact = (
+        "Thank you for letting me know your situation. Please contact the support hotline "
+        "at one two three four. Thank you and goodbye.<dialog-end>"
+    )
+    data = ConversationData(
+        system_prompt=(
+            "**6.1 Escalation Action:**\n"
+            f"When an escalation is triggered, deliver the following message exactly \"{exact}\"."
+        ),
+        interactions=[
+            Interaction(role="user", content="I already paid."),
+            Interaction(role="assistant", content="Which date was that?"),
+        ],
+    )
+    case = {
+        "turn_index": 1,
+        "error_type": "escalation_action_not_followed",
+        "evidence": "deliver the following message exactly and stop negotiation.",
+        "recommendation": "Use the exact configured escalation action and hotline ending.",
+    }
+
+    assert exact_responses_for_case_records(data, [case]) == {1: exact}
 
 
 def test_required_tool_for_case_still_infers_missing_tool_case() -> None:
@@ -240,6 +266,7 @@ def test_apply_prompt_cases_retries_unchanged_prompt_like_app(monkeypatch) -> No
         }
     ]
     prompts_seen = []
+    force_flags = []
 
     class FakeOptimization:
         def __init__(self, prompt: str) -> None:
@@ -258,6 +285,7 @@ def test_apply_prompt_cases_retries_unchanged_prompt_like_app(monkeypatch) -> No
 
     def fake_apply_recommendation_to_system_prompt(**kwargs):
         prompts_seen.append(kwargs["bad_case"].recommendation)
+        force_flags.append(kwargs.get("force_prompt_edit", False))
         if len(prompts_seen) == 1:
             return FakeOptimization(kwargs["current_system_prompt"])
         return FakeOptimization(kwargs["current_system_prompt"] + " + retry edit")
@@ -291,6 +319,7 @@ def test_apply_prompt_cases_retries_unchanged_prompt_like_app(monkeypatch) -> No
     )
 
     assert "previous apply attempt returned the system prompt unchanged" in prompts_seen[1].lower()
+    assert force_flags == [False, True]
     assert updated_data.system_prompt == "Prompt v0 + retry edit"
     assert meta["prompt_edit_retries"] == 1
     assert applied[0]["prompt_changed"] is True

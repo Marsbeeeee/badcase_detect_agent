@@ -23,6 +23,7 @@ from prompt_optimizer_agent.agent_logic import (  # noqa: E402
     _local_prompt_rule_bad_cases,
     analyze_bad_cases,
     apply_recommendation_to_system_prompt,
+    extract_exact_escalation_message,
     generate_experiment_conclusion,
     rerun_conversation,
 )
@@ -513,7 +514,12 @@ def apply_prompt_cases_with_llm(
 
     prompt_target_turns = rerun_targets_for_case_records(data, applied_prompt_cases)
     required_tools_by_turn = required_tools_for_case_records(data, tool_cases)
-    combined_target_turns = set(prompt_target_turns) | set(required_tools_by_turn)
+    required_exact_responses_by_turn = exact_responses_for_case_records(data, applied_prompt_cases)
+    combined_target_turns = (
+        set(prompt_target_turns)
+        | set(required_tools_by_turn)
+        | set(required_exact_responses_by_turn)
+    )
     if combined_target_turns:
         rerun_data = data.model_copy(
             update={"system_prompt": working_prompt, "interactions": current_interactions}
@@ -524,6 +530,7 @@ def apply_prompt_cases_with_llm(
             llm_settings=settings,
             target_assistant_turn_indices=combined_target_turns,
             required_tools_by_turn=required_tools_by_turn,
+            required_exact_responses_by_turn=required_exact_responses_by_turn,
         )
         rerun_errors.extend(result.error for result in rerun_results if result.error)
         rerun_target_turns.update(combined_target_turns)
@@ -535,6 +542,7 @@ def apply_prompt_cases_with_llm(
                 "required_tools_by_turn": {
                     str(turn): tool for turn, tool in sorted(required_tools_by_turn.items())
                 },
+                "required_exact_response_turns": sorted(required_exact_responses_by_turn),
                 "result_count": len(rerun_results),
                 "error_count": len([result for result in rerun_results if result.error]),
             }
@@ -611,6 +619,7 @@ def retry_prompt_edit_if_unchanged_batch(
         current_system_prompt=current_prompt,
         bad_case=retry_case,
         llm_settings=llm_settings,
+        force_prompt_edit=True,
     )
     if retry_optimization.optimized_prompt == current_prompt:
         return optimization, 1
@@ -946,6 +955,24 @@ def required_tools_for_case_records(
     for case, required_tool in tool_cases:
         for target_index in rerun_targets_for_case_records(data, [case]):
             required[target_index] = required_tool
+    return required
+
+
+def exact_responses_for_case_records(
+    data: ConversationData,
+    prompt_cases: list[dict[str, Any]],
+) -> dict[int, str]:
+    exact_message = extract_exact_escalation_message(data.system_prompt)
+    if not exact_message:
+        return {}
+    required: dict[int, str] = {}
+    for case in prompt_cases:
+        if str(case.get("error_type") or "").lower() != "escalation_action_not_followed":
+            continue
+        if not case_requires_exact_spoken_message(case):
+            continue
+        for target_index in rerun_targets_for_case_records(data, [case]):
+            required[target_index] = exact_message
     return required
 
 

@@ -28,6 +28,10 @@ from prompt_optimizer_agent.company_demo_client import _prompt_hash
 from prompt_optimizer_agent.json_utils import ConversationData, Interaction, parse_conversation_json
 
 
+def test_default_company_model_is_voyager() -> None:
+    assert agent_logic.DEFAULT_COMPANY_MODEL == "voyager-1.6-preview-run27m4a8b4-r3"
+
+
 def test_parse_judge_bad_case_uses_explicit_turn_index() -> None:
     data = ConversationData(
         system_prompt="Follow flow.",
@@ -172,6 +176,36 @@ def test_local_scan_flags_ptp_attempt_limit_with_counted_evidence() -> None:
     assert "user turns 4, 6, 8" in case.evidence
     assert "State 4.0 (RTP_Closing)" in case.evidence
     assert len(case.evidence) < 650
+
+
+def test_local_scan_accepts_final_rtp_closing_after_late_payment_date() -> None:
+    data = ConversationData(
+        system_prompt=(
+            "If user_date is later than the maximum payment date, immediately proceed to RTP_Closing. "
+            "Do not negotiate after a late date."
+        ),
+        interactions=[
+            Interaction(role="user", content="Maybe next month."),
+            Interaction(
+                role="assistant",
+                content=(
+                    "I understand your situation. However, payment must be completed by "
+                    "August 1, 2027 to keep the account status in good standing. If payment "
+                    "is not made, additional fees and follow-up collection may apply. "
+                    "Please complete the payment through the available payment channel. "
+                    "Thank you for your time.<dialog-end>"
+                ),
+            ),
+        ],
+    )
+
+    cases = _local_prompt_rule_bad_cases(data)
+
+    assert [
+        case.error_type
+        for case in cases
+        if case.error_type == "late_payment_proposal_not_rtp_closing"
+    ] == []
 
 
 def test_local_scan_flags_missing_fresh_promotion_search() -> None:
@@ -717,7 +751,7 @@ def test_prompt_edit_uses_exact_replace_patch() -> None:
         agent_logic._chat_json = old_chat_json
 
 
-def test_prompt_edit_falls_back_to_full_prompt_when_patch_cannot_apply() -> None:
+def test_prompt_edit_retries_exact_patch_when_initial_patch_cannot_apply() -> None:
     old_chat_json = agent_logic._chat_json
     calls = []
 
@@ -725,6 +759,17 @@ def test_prompt_edit_falls_back_to_full_prompt_when_patch_cannot_apply() -> None
         calls.append(purpose)
         if purpose == "prompt_edit_patch":
             return json.dumps({"replace": {"old": "missing text", "new": "replacement"}})
+        if purpose == "prompt_edit_json_patch_retry":
+            return json.dumps(
+                {
+                    "replace": {
+                        "old": "Step 2: Ask for a phone number.",
+                        "new": "Step 2: Ask for a phone number or account name.",
+                    },
+                    "rationale": "Retried as exact patch.",
+                    "applied_feedback_summary": "Patched Step 2.",
+                }
+            )
         return json.dumps(
             {
                 "optimized_prompt": "Step 1: Greet.\nStep 2: Ask for a phone number or account name.",
@@ -758,7 +803,7 @@ def test_prompt_edit_falls_back_to_full_prompt_when_patch_cannot_apply() -> None
         )
 
         assert result.optimized_prompt.endswith("account name.")
-        assert calls == ["prompt_edit_patch", "prompt_edit"]
+        assert calls == ["prompt_edit_patch", "prompt_edit_json_patch_retry"]
     finally:
         agent_logic._chat_json = old_chat_json
 
@@ -856,7 +901,7 @@ def test_json_repair_log_preserves_original_and_repaired_text(monkeypatch, tmp_p
     assert payload["repaired_json"] == '{"ok": true}'
 
 
-def test_prompt_edit_retries_as_patch_when_full_json_is_malformed() -> None:
+def test_prompt_edit_leaves_prompt_unchanged_when_patch_retry_cannot_apply() -> None:
     old_chat_json = agent_logic._chat_json
     calls = []
 
@@ -864,19 +909,8 @@ def test_prompt_edit_retries_as_patch_when_full_json_is_malformed() -> None:
         calls.append(purpose)
         if purpose == "prompt_edit_patch":
             return json.dumps({"replace": {"old": "missing text", "new": "replacement"}})
-        if purpose == "prompt_edit":
-            return '{"optimized_prompt": "Step 1: Greet.\nStep 2: Ask for account name.'
         if purpose == "prompt_edit_json_patch_retry":
-            return json.dumps(
-                {
-                    "replace": {
-                        "old": "Step 2: Ask for a phone number.",
-                        "new": "Step 2: Ask for a phone number or account name.",
-                    },
-                    "rationale": "Retried as small patch.",
-                    "applied_feedback_summary": "Patched Step 2.",
-                }
-            )
+            return json.dumps({"replace": {"old": "still missing", "new": "replacement"}})
         raise AssertionError(f"unexpected purpose {purpose}")
 
     agent_logic._chat_json = fake_chat_json
@@ -905,11 +939,12 @@ def test_prompt_edit_retries_as_patch_when_full_json_is_malformed() -> None:
     finally:
         agent_logic._chat_json = old_chat_json
 
-    assert result.optimized_prompt == "Step 1: Greet.\nStep 2: Ask for a phone number or account name."
-    assert calls == ["prompt_edit_patch", "prompt_edit", "prompt_edit_json_patch_retry"]
+    assert result.optimized_prompt == "Step 1: Greet.\nStep 2: Ask for a phone number."
+    assert "exact replacement patch" in result.rationale
+    assert calls == ["prompt_edit_patch", "prompt_edit_json_patch_retry"]
 
 
-def test_prompt_edit_rejects_truncated_full_prompt() -> None:
+def test_prompt_edit_does_not_accept_full_prompt_retry() -> None:
     old_chat_json = agent_logic._chat_json
     calls = []
     current_prompt = "\n".join(
@@ -949,9 +984,7 @@ def test_prompt_edit_rejects_truncated_full_prompt() -> None:
         calls.append(purpose)
         if purpose == "prompt_edit_patch":
             return json.dumps({"replace": {"old": "missing text", "new": "replacement"}})
-        if purpose == "prompt_edit":
-            return json.dumps({"optimized_prompt": truncated_prompt})
-        if purpose == "prompt_edit_retry":
+        if purpose == "prompt_edit_json_patch_retry":
             return json.dumps({"optimized_prompt": truncated_prompt})
         raise AssertionError(f"unexpected purpose {purpose}")
 
@@ -982,8 +1015,133 @@ def test_prompt_edit_rejects_truncated_full_prompt() -> None:
         agent_logic._chat_json = old_chat_json
 
     assert result.optimized_prompt == current_prompt
-    assert "rejected" in result.rationale
-    assert calls == ["prompt_edit_patch", "prompt_edit", "prompt_edit_retry"]
+    assert "exact replacement patch" in result.rationale
+    assert calls == ["prompt_edit_patch", "prompt_edit_json_patch_retry"]
+
+
+def test_late_payment_prompt_edit_rejects_unrelated_patch_and_uses_generic_guard() -> None:
+    old_chat_json = agent_logic._chat_json
+    calls = []
+    current_prompt = (
+        "## 1.0 Global Rules\n"
+        "- If the user intention to connect with the agent, the labelling priority will be 'Label D' comes first\n\n"
+        "**Step 2.1: Payment Proposal Collection**\n"
+        "If the user disagree to pay but does not mention a date, or mentioned a vague date, "
+        "prompt the user for a date, do not ask for an amount as you only accept full amount payment.\n\n"
+        "**4.1.5 Maximum Payment Date Validation:**\n\n"
+        "If the user proposes a payment date that is later than the configured maximum date, you must:\n\n"
+        "- NOT accept the proposal.\n"
+        "- NOT negotiate further.\n"
+        "- Immediately proceed to **PART 2 State 4.0 (RTP_Closing)**.\n\n"
+        "You must simply move to RTP_Closing and restate that payment must be made by the configured maximum date "
+        "to maintain account status.\n\n"
+        "## 4.0 RTP_Closing State\n"
+        "Your closing statement must include a final request, consequences, payment channels, "
+        "and a polite closing."
+    )
+
+    def fake_chat_json(settings, messages, purpose="json"):
+        calls.append(purpose)
+        return json.dumps(
+            {
+                "replace": {
+                    "old": "- If the user intention to connect with the agent, the labelling priority will be 'Label D' comes first",
+                    "new": "-",
+                },
+                "rationale": "Removed unrelated label sentence.",
+                "applied_feedback_summary": "Patched unrelated rule.",
+            }
+        )
+
+    agent_logic._chat_json = fake_chat_json
+    try:
+        data = ConversationData(
+            system_prompt=current_prompt,
+            interactions=[
+                Interaction(role="user", content="Maybe next month."),
+                Interaction(role="assistant", content="Can you pay earlier?"),
+            ],
+        )
+        result = apply_recommendation_to_system_prompt(
+            data=data,
+            current_system_prompt=current_prompt,
+            bad_case=BadCase(
+                turn_index=1,
+                role="assistant",
+                error_type="late_payment_proposal_not_rtp_closing",
+                evidence="Assistant negotiated after a late date.",
+                recommendation="Route late payment dates to RTP_Closing.",
+            ),
+            llm_settings=LLMSettings(
+                backend="company_api",
+                model="m",
+                provider="p",
+                base_url="http://example.test",
+            ),
+        )
+    finally:
+        agent_logic._chat_json = old_chat_json
+
+    assert "labelling priority will be 'Label D'" in result.optimized_prompt
+    assert "Rule conflict resolver for late-date proposals:" in result.optimized_prompt
+    assert "Rule conflict resolver before proposal clarification:" in result.optimized_prompt
+    assert "Rule conflict resolver inside RTP_Closing:" in result.optimized_prompt
+    assert "configured maximum payment date" in result.optimized_prompt
+    assert "higher-priority date-validation rule" in result.optimized_prompt
+    assert "current system prompt and RTP_Closing section" in result.optimized_prompt
+    assert result.rationale.startswith("Applied deterministic local rule-conflict patch")
+    assert calls == ["prompt_edit_patch", "prompt_edit_json_patch_retry"]
+
+
+def test_forced_late_payment_prompt_edit_reinforces_existing_resolver() -> None:
+    old_chat_json = agent_logic._chat_json
+    calls = []
+    current_prompt = (
+        "**4.1.5 Maximum Payment Date Validation:**\n"
+        "If the user proposes a payment date later than the maximum date, proceed to RTP_Closing.\n\n"
+        + agent_logic._late_date_validation_conflict_guard().strip()
+        + "\n\n## 4.0 RTP_Closing State\n"
+        "Close the conversation."
+    )
+
+    def fake_chat_json(settings, messages, purpose="json"):
+        calls.append(purpose)
+        return json.dumps({"replace": {"old": "missing", "new": "replacement"}})
+
+    agent_logic._chat_json = fake_chat_json
+    try:
+        data = ConversationData(
+            system_prompt=current_prompt,
+            interactions=[
+                Interaction(role="user", content="Maybe next month."),
+                Interaction(role="assistant", content="Can you pay earlier?"),
+            ],
+        )
+        result = apply_recommendation_to_system_prompt(
+            data=data,
+            current_system_prompt=current_prompt,
+            bad_case=BadCase(
+                turn_index=1,
+                role="assistant",
+                error_type="late_payment_proposal_not_rtp_closing",
+                evidence="Residual scan still found negotiation after the existing resolver was applied.",
+                recommendation="Strengthen the existing resolver with deterministic forbidden outputs.",
+            ),
+            llm_settings=LLMSettings(
+                backend="company_api",
+                model="m",
+                provider="p",
+                base_url="http://example.test",
+            ),
+            force_prompt_edit=True,
+        )
+    finally:
+        agent_logic._chat_json = old_chat_json
+
+    assert "Residual-verification reinforcement for late-date proposals:" in result.optimized_prompt
+    assert "Forbidden outputs include suggesting payment before the deadline" in result.optimized_prompt
+    assert result.optimized_prompt != current_prompt
+    assert calls == ["prompt_edit_patch", "prompt_edit_json_patch_retry"]
 
 
 def test_prompt_edit_retries_overlong_branch_paragraph() -> None:
@@ -1018,11 +1176,9 @@ def test_prompt_edit_retries_overlong_branch_paragraph() -> None:
     def fake_chat_json(settings, messages, purpose="json"):
         calls.append(purpose)
         if purpose == "prompt_edit_patch":
-            return json.dumps({"replace": {"old": "missing text", "new": "replacement"}})
-        if purpose == "prompt_edit":
-            return json.dumps({"optimized_prompt": long_branch})
-        if purpose == "prompt_edit_retry":
-            return json.dumps({"optimized_prompt": structured_prompt})
+            return json.dumps({"replace": {"old": current_prompt, "new": long_branch}})
+        if purpose == "prompt_edit_json_patch_retry":
+            return json.dumps({"replace": {"old": current_prompt, "new": structured_prompt}})
         raise AssertionError(f"unexpected purpose {purpose}")
 
     agent_logic._chat_json = fake_chat_json
@@ -1053,7 +1209,7 @@ def test_prompt_edit_retries_overlong_branch_paragraph() -> None:
         )
 
         assert result.optimized_prompt == structured_prompt
-        assert calls == ["prompt_edit_patch", "prompt_edit", "prompt_edit_retry"]
+        assert calls == ["prompt_edit_patch", "prompt_edit_json_patch_retry"]
     finally:
         agent_logic._chat_json = old_chat_json
 

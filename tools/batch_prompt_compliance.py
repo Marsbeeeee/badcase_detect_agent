@@ -53,6 +53,8 @@ LATEST_REVIEW_JSON = "batch_review.json"
 LATEST_REVIEW_MD = "batch_review.md"
 LATEST_APPLY_CONCLUSION_JSON = "batch_apply_conclusion.json"
 LATEST_APPLY_CONCLUSION_MD = "batch_apply_conclusion.md"
+REVIEW_SNAPSHOT_PATTERNS = ("*_review.json", "*_review.md")
+APPLY_SNAPSHOT_PATTERNS = ("*_updated.json", "*_conclusion.json", "*_conclusion.md")
 
 
 def main() -> int:
@@ -146,6 +148,7 @@ def run_scan(args: argparse.Namespace) -> int:
     files = discover_files([Path(path).expanduser() for path in args.paths], args.pattern, not args.no_recursive)
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_generated_snapshots(output_dir, REVIEW_SNAPSHOT_PATTERNS)
     batch_id = args.batch_id or new_batch_id("batch-scan")
     judge_settings = build_judge_settings(args)
 
@@ -205,6 +208,7 @@ def run_apply(args: argparse.Namespace) -> int:
     batch_id = args.batch_id or f"{review.get('batch_id', 'batch')}-apply"
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_generated_snapshots(output_dir, APPLY_SNAPSHOT_PATTERNS)
     approved_ids = load_approved_ids(args, review)
     if not approved_ids:
         raise SystemExit("No approved case ids. Use --approve-all or provide --approval-file.")
@@ -271,6 +275,7 @@ def run_continue_residual(args: argparse.Namespace) -> int:
     batch_id = args.batch_id or f"{conclusion.get('batch_id', 'batch')}-residual-continue"
     output_dir = Path(args.review_output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_generated_snapshots(output_dir, REVIEW_SNAPSHOT_PATTERNS)
     review = build_residual_continue_review(conclusion, batch_id=batch_id)
 
     review_json = output_dir / LATEST_REVIEW_JSON
@@ -392,6 +397,13 @@ def build_judge_settings(args: argparse.Namespace) -> LLMSettings:
     if args.judge == "openai":
         return LLMSettings(backend="openai", model=args.model or os.getenv("PROMPT_OPTIMIZER_MODEL", "gpt-4o-mini"))
     return LLMSettings(backend="openai", model="local-scan-only")
+
+
+def cleanup_generated_snapshots(output_dir: Path, patterns: tuple[str, ...]) -> None:
+    for pattern in patterns:
+        for path in output_dir.glob(pattern):
+            if path.is_file():
+                path.unlink()
 
 
 def discover_files(paths: list[Path], pattern: str, recursive: bool) -> list[Path]:

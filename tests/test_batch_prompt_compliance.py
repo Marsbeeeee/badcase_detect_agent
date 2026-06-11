@@ -163,6 +163,9 @@ def test_run_scan_overwrites_latest_review_snapshot(tmp_path, monkeypatch) -> No
     source = tmp_path / "conversation.json"
     source.write_text("{}", encoding="utf-8")
     output_dir = tmp_path / "scan"
+    output_dir.mkdir()
+    (output_dir / "skill-scan-old_review.json").write_text("{}", encoding="utf-8")
+    (output_dir / "skill-scan-old_review.md").write_text("# old", encoding="utf-8")
     log_path = tmp_path / "rounds.jsonl"
     batches = iter(["scan-one", "scan-two"])
 
@@ -215,6 +218,10 @@ def test_run_apply_writes_latest_snapshot_without_batch_subdirectory(tmp_path, m
         encoding="utf-8",
     )
     output_dir = tmp_path / "applied"
+    output_dir.mkdir()
+    (output_dir / "conversation_updated.json").write_text("{}", encoding="utf-8")
+    (output_dir / "skill-apply-old_conclusion.json").write_text("{}", encoding="utf-8")
+    (output_dir / "skill-apply-old_conclusion.md").write_text("# old", encoding="utf-8")
     log_path = tmp_path / "rounds.jsonl"
 
     monkeypatch.setattr(

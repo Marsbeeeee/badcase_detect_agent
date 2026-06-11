@@ -77,6 +77,13 @@ If all applicable strategies fail, report `backend_failed_to_autonomously_repair
 - Record or cite apply and residual-scan round ids after Apply.
 - Use round ids to distinguish repeated optimization cycles.
 
+## Output Hygiene
+
+- Keep `outputs/skill_scan` as the latest review snapshot only: `batch_review.json` and `batch_review.md`.
+- Keep `outputs/skill_scan/applied` as the latest apply snapshot only: `batch_apply_conclusion.json`, `batch_apply_conclusion.md`, and the current apply's `*_updated.json` file(s).
+- Overwrite those stable files on each run. Do not create batch-id-named output files or batch-id-named subdirectories.
+- Clean stale generated snapshots before writing new ones. Historical traceability belongs in `logs/optimization_rounds.jsonl`, not in accumulated review/apply files.
+
 ## Required Conclusion
 
 After every approved Apply cycle, return exactly three semantic parts:

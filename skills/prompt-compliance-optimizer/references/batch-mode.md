@@ -6,9 +6,10 @@ Use Batch Mode only when the user explicitly provides multiple JSON files or a f
 
 1. Run `tools/batch_prompt_compliance.py scan <file-or-folder> ...`.
 2. Update the latest snapshot files `batch_review.json` and `batch_review.md` in the output directory.
-3. Record one scan round per file in `logs/optimization_rounds.jsonl`.
-4. Summarize candidate badcases by file.
-5. Stop for human review before Apply.
+3. Remove stale generated review files such as `*_review.json` and `*_review.md` before writing the new snapshot.
+4. Record one scan round per file in `logs/optimization_rounds.jsonl`.
+5. Summarize candidate badcases by file.
+6. Stop for human review before Apply.
 
 ## Apply
 
@@ -16,10 +17,11 @@ Use Batch Mode only when the user explicitly provides multiple JSON files or a f
 2. Build a Repair Plan for every approved case and mark unsupported cases.
 3. Run `tools/batch_prompt_compliance.py apply <batch_review.json>` with `--approve-all` or an approval file.
 4. Update one `<source-stem>_updated.json` output per input file and the stable `batch_apply_conclusion.json/.md` snapshots directly in the apply output directory.
-5. Record per-file apply and residual-scan rounds.
-6. Return one aggregate conclusion plus per-file conclusions.
+5. Remove stale generated apply files such as `*_updated.json`, `*_conclusion.json`, and `*_conclusion.md` before writing the new snapshot.
+6. Record per-file apply and residual-scan rounds.
+7. Return one aggregate conclusion plus per-file conclusions.
 
-The output directories contain only the latest test snapshot. Do not create batch-id-named review files or apply subdirectories. Keep historical round records in `logs/optimization_rounds.jsonl`; `batch_id` remains a tracing identifier, not an output path.
+The output directories must contain only the latest generated snapshot for each function. Do not create batch-id-named review files, batch-id-named conclusion files, or apply subdirectories. Keep historical round records in `logs/optimization_rounds.jsonl`; `batch_id` remains a tracing identifier, not an output path.
 
 ## Residual Continuation
 

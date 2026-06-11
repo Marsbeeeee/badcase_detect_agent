@@ -96,11 +96,17 @@ def test_batch_conclusion_has_three_semantic_parts_with_backend_evidence() -> No
     markdown = render_apply_conclusion_markdown(conclusion)
 
     assert sections["verification_verdict"].startswith("Not fixed.")
+    assert "Root cause analysis:" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "negotiation/proposal-clarification path" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "Evidence data (surface):" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "Evidence data (deep):" in sections["badcase_diagnosis_and_backend_evidence"]
     assert "openai_api_like/voyager-test" in sections["badcase_diagnosis_and_backend_evidence"]
     assert "request-1" in sections["badcase_diagnosis_and_backend_evidence"]
     assert "avg=-0.01" in sections["badcase_diagnosis_and_backend_evidence"]
-    assert "does not prove compliance" in sections["badcase_diagnosis_and_backend_evidence"]
-    assert "Turn 9 asked for another date." in sections["verification_verdict"]
+    assert "stable wrong-branch preference" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "residual scan remains correctness evidence" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert len(sections["badcase_diagnosis_and_backend_evidence"]) < 1800
+    assert "Turn 9 asked for another date." not in sections["verification_verdict"]
     assert sections["next_action"].startswith(
         "Primary action: Route recognized beyond-maximum-date triggers through deterministic backend RTP_Closing"
     )

@@ -901,15 +901,17 @@ def prompt_has_exact_message_ground_truth(system_prompt: str) -> bool:
     prompt = system_prompt.lower()
     if not any(phrase in prompt for phrase in ("message exactly", "say exactly", "deliver the following message exactly")):
         return False
+    quote_chars = "\"'\u201c\u201d\u2018\u2019"
+    escaped_quotes = re.escape(quote_chars)
     quoted_exact_message = re.search(
-        r"(?:message exactly|say exactly|deliver the following message exactly)\s*[:锛歖?\s*[\"鈥淽[^\"鈥漖{20,}[\"鈥漖",
+        rf"(?:message exactly|say exactly|deliver the following message exactly)\s*[:\uFF1A]?\s*"
+        rf"[{escaped_quotes}][^{escaped_quotes}]{{20,}}[{escaped_quotes}]",
         system_prompt,
         flags=re.IGNORECASE | re.DOTALL,
     )
     if quoted_exact_message:
         return True
     return "hotline" in prompt or "transfer" in prompt
-
 
 def build_verification_failures(
     applied_cases: list[dict[str, Any]],
@@ -1562,85 +1564,7 @@ def render_review_markdown(review: dict[str, Any]) -> str:
 
 
 def _legacy_render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
-    fix_summary = batch_fix_summary(conclusion)
-    lines = [
-        f"# Batch Apply Conclusion: {conclusion['batch_id']}",
-        "",
-        "## Conclusion",
-        "",
-        fix_summary,
-        "",
-        "## Verification",
-        "",
-        (
-            f"Residual scan found {conclusion['residual_badcase_count']} remaining badcase(s). "
-            f"Unsupported approved cases: {conclusion['unsupported_case_count']}. "
-            f"Verification failures: {conclusion.get('verification_failure_count', 0)}."
-        ),
-        "",
-        f"Failure categories: {format_failure_category_counts(conclusion.get('failure_category_counts') or {})}",
-        "",
-        "## 涓枃鎽樿",
-        "",
-        f"- 浜哄伐纭鐨?badcase锛歿conclusion['approved_case_count']} 涓?,
-        f"- 宸插皾璇曞簲鐢ㄦ敼鍔細{conclusion['applied_case_count']} 涓?,
-        f"- 宸查€氳繃 residual scan 楠岃瘉淇锛歿conclusion.get('fixed_case_count', 0)} 涓?,
-        f"- 鏈兘鑷姩搴旂敤鏀瑰姩锛歿conclusion['unsupported_case_count']} 涓?,
-        f"- 宸叉敼鍔ㄤ絾楠屾敹澶辫触锛歿conclusion.get('verification_failure_count', 0)} 涓?,
-        f"- residual scan 浠嶅墿浣欙細{conclusion['residual_badcase_count']} 涓?,
-        "",
-        "澶辫触鍒嗙被锛?,
-        "",
-        *format_failure_category_lines_zh(conclusion.get("failure_category_counts") or {}),
-        "",
-        "## Files",
-        "",
-    ]
-    for item in conclusion.get("files") or []:
-        lines.extend(
-            [
-                f"- `{item.get('source_file')}`",
-                f"  - status: `{item.get('status')}`",
-                f"  - updated_file: `{item.get('updated_file')}`",
-                f"  - scan/apply/residual: `{item.get('scan_event_id')}` / `{item.get('apply_event_id')}` / `{item.get('residual_scan_event_id')}`",
-                f"  - apply_mode: `{item.get('apply_mode') or 'none'}`",
-                f"  - prompt_changed: `{item.get('prompt_changed', False)}`",
-                f"  - rerun_target_turns: {', '.join(str(turn) for turn in item.get('rerun_target_turns') or []) or 'none'}",
-                f"  - rerun_errors: {len(item.get('rerun_errors') or [])}",
-                f"  - required_tools: {', '.join(item.get('required_tools') or []) or 'none'}",
-                f"  - applied: {item.get('applied_case_count', 0)}, fixed: {item.get('fixed_case_count', 0)}, residual: {item.get('residual_badcase_count', 0)}, unsupported: {len(item.get('unsupported_cases') or [])}",
-                f"  - failure_categories: {format_failure_category_counts(item.get('failure_category_counts') or {})}",
-                f"  - 涓枃澶辫触鍒嗙被: {format_failure_category_counts_zh(item.get('failure_category_counts') or {})}",
-            ]
-        )
-        if item.get("app_conclusion"):
-            lines.append("  - app_style_conclusion:")
-            for line in str(item.get("app_conclusion") or "").splitlines():
-                if line.strip():
-                    lines.append(f"    {line}")
-        for unsupported in item.get("unsupported_cases") or []:
-            lines.append(
-                f"  - unsupported `{unsupported.get('id')}`: {failure_category_label_zh(unsupported.get('failure_category'))} (`{unsupported.get('failure_category') or 'unknown'}`)"
-            )
-        for failure in item.get("verification_failures") or []:
-            lines.append(
-                f"  - verification_failure `{failure.get('case_id')}` -> residual `{failure.get('residual_case_id')}`: {failure_category_label_zh(failure.get('failure_category'))} (`{failure.get('failure_category')}`)"
-            )
-    lines.extend(
-        [
-            "",
-            "## Next",
-            "",
-            (
-                "Cycle complete. Do not start another scan unless requested."
-                if conclusion["residual_badcase_count"] == 0
-                else "Residual badcases remain and need human review."
-            ),
-            "",
-        ]
-    )
-    return "\n".join(lines)
-
+    return render_apply_conclusion_markdown(conclusion)
 
 def build_batch_conclusion_sections(conclusion: dict[str, Any]) -> dict[str, Any]:
     approved = int(conclusion.get("approved_case_count") or 0)
@@ -1690,24 +1614,18 @@ def build_batch_conclusion_sections(conclusion: dict[str, Any]) -> dict[str, Any
             f"{residual} residual badcase(s), {failures} verification failure(s), and {unsupported} unsupported case(s). "
             f"Residual turns: {residual_turns or 'none recorded'}."
         )
-    residual_evidence = [
-        _truncate_conclusion_text(str(case.get("evidence") or ""), 500)
-        for item in conclusion.get("files") or []
-        for case in item.get("residual_badcases") or []
-        if case.get("evidence")
-    ]
-    residual_evidence.extend(
-        _truncate_conclusion_text(str(failure.get("residual_evidence") or ""), 500)
-        for item in conclusion.get("files") or []
-        for failure in item.get("verification_failures") or []
-        if failure.get("residual_evidence")
-    )
-    if residual_evidence:
-        verdict += " Residual evidence: " + " | ".join(residual_evidence[:3])
-
+    if file_evidence:
+        surface = "\n".join(f"- {evidence['surface_summary']}" for evidence in file_evidence)
+        deep = "\n".join(f"- {evidence['deep_summary']}" for evidence in file_evidence)
+    else:
+        surface = "- No per-file surface evidence was recorded."
+        deep = "- No per-file backend evidence was recorded."
+    root_cause = _build_root_cause_analysis(conclusion, file_evidence)
     diagnosis = (
-        f"Failure categories: {format_failure_category_counts(conclusion.get('failure_category_counts') or {})}. "
-        + (" ".join(evidence["diagnosis"] for evidence in file_evidence) if file_evidence else "No per-file backend evidence was recorded.")
+        f"Failure categories: {format_failure_category_counts(conclusion.get('failure_category_counts') or {})}.\n\n"
+        f"Root cause analysis:\n{root_cause}\n\n"
+        f"Evidence data (surface):\n{surface}\n\n"
+        f"Evidence data (deep):\n{deep}"
     )
 
     next_experiments = [
@@ -1744,6 +1662,56 @@ def build_batch_conclusion_sections(conclusion: dict[str, Any]) -> dict[str, Any
     }
 
 
+def _build_root_cause_analysis(conclusion: dict[str, Any], file_evidence: list[dict[str, Any]]) -> str:
+    failures = [
+        failure
+        for item in conclusion.get("files") or []
+        for failure in item.get("verification_failures") or []
+    ]
+    if not failures:
+        if int(conclusion.get("residual_badcase_count") or 0) == 0:
+            return (
+                "- Residual scan found no remaining badcases. The prompt/rerun changes are treated as execution evidence, "
+                "while the residual scan is the correctness evidence."
+            )
+        return "- Residual badcases remain, but no structured verification failure was recorded; inspect the residual cases directly."
+
+    lines = []
+    evidence_by_source = {evidence.get("source_file"): evidence for evidence in file_evidence}
+    for item in conclusion.get("files") or []:
+        evidence = evidence_by_source.get(item.get("source_file")) or {}
+        logprob_read = str(evidence.get("logprob_interpretation") or "no logprob interpretation available")
+        for failure in item.get("verification_failures") or []:
+            error_type = str(failure.get("error_type") or "unknown")
+            turn = failure.get("turn_index")
+            residual_turn = failure.get("residual_turn_index")
+            case_id = failure.get("case_id") or "unknown"
+            residual_id = failure.get("residual_case_id") or "unknown"
+            if error_type == "late_payment_proposal_not_rtp_closing":
+                cause = (
+                    "The prompt edit and targeted rerun executed, but the model still routed a beyond-maximum-date "
+                    "payment proposal into the negotiation/proposal-clarification path instead of terminal RTP_Closing. "
+                    "That points to a branch-priority or routing failure, not a missing scan."
+                )
+            elif error_type == "escalation_action_not_followed":
+                cause = (
+                    "The model continued the conversation after an escalation trigger instead of treating the exact "
+                    "escalation action as terminal, indicating the escalation branch was not dominant enough."
+                )
+            elif error_type == "busy_availability_check_skipped":
+                cause = (
+                    "The model skipped the availability gate and entered the payment sequence too early, indicating "
+                    "the busy/unavailable branch priority was under-specified."
+                )
+            else:
+                cause = "The rerun still matched the residual rule violation, so the applied change did not control the relevant branch."
+            lines.append(
+                f"- `{case_id}` -> `{residual_id}` turn {turn or residual_turn}: {cause} "
+                f"Logprob read: {logprob_read}."
+            )
+    return "\n".join(lines)
+
+
 def _batch_file_conclusion_evidence(item: dict[str, Any]) -> dict[str, Any]:
     reruns = item.get("rerun_results") or []
     prompt_edits = item.get("prompt_edit_summaries") or []
@@ -1775,44 +1743,89 @@ def _batch_file_conclusion_evidence(item: dict[str, Any]) -> dict[str, Any]:
                 ],
             }
         )
-    logprob_available = [detail for detail in rerun_details if detail["logprobs_available"]]
-    if logprob_available:
-        logprob_summary = (
-            "Logprobs were available for rerun output. "
-            + "; ".join(
-                f"turn {detail['turn']}: avg={detail['avg_logprob']}, min={detail['min_logprob']}, "
-                f"low_confidence_tokens={detail['low_confidence_tokens']}"
-                for detail in logprob_available
-            )
-            + ". High confidence only means the backend strongly preferred its output; it does not prove compliance."
-        )
-    else:
-        logprob_summary = "No usable logprob evidence was attached; do not attribute the failure to token uncertainty."
-
-    residual_summary = " | ".join(
-        f"turn {case.get('turn_index')} {case.get('error_type')}: {_truncate_conclusion_text(str(case.get('evidence') or ''), 450)}"
+    logprob_summary, logprob_interpretation = _summarize_logprobs(rerun_details, residual_cases)
+    residual_summary = "; ".join(
+        f"turn {case.get('turn_index')} {case.get('error_type')}"
         for case in residual_cases
     ) or "none"
     patch_summary = " | ".join(
-        f"case {edit.get('case_id')}: {edit.get('applied_feedback_summary')}; rationale={edit.get('rationale')}"
+        f"{edit.get('case_id')}: {_truncate_conclusion_text(str(edit.get('applied_feedback_summary') or ''), 140)}"
         for edit in prompt_edits
     ) or "none"
+    request_ids = [str(detail.get("request_id")) for detail in rerun_details if detail.get("request_id")]
+    failed_ids = [
+        f"{failure.get('case_id')}->{failure.get('residual_case_id')}"
+        for failure in item.get("verification_failures") or []
+    ]
+    file_name = Path(str(item.get("source_file") or "unknown")).name
+    surface_summary = (
+        f"{file_name}: applied={item.get('applied_case_count', 0)}, fixed={item.get('fixed_case_count', 0)}, "
+        f"residual={item.get('residual_badcase_count', 0)}, unsupported={len(item.get('unsupported_cases') or [])}; "
+        f"residual={residual_summary}; verification_failures={', '.join(failed_ids) or 'none'}."
+    )
+    deep_summary = (
+        f"{file_name}: backend={item.get('apply_provider') or 'unknown'}/{item.get('apply_model') or 'unknown'}, "
+        f"prompt_hash={item.get('before_hash') or '-'}->{item.get('after_hash') or '-'}, "
+        f"prompt_changed={bool(item.get('prompt_changed'))}, rerun_targets={item.get('rerun_target_turns') or []}, "
+        f"request_ids={', '.join(request_ids) or 'none'}, prompt_edits={patch_summary}, {logprob_summary}"
+    )
     diagnosis = (
-        f"{Path(str(item.get('source_file') or 'unknown')).name}: the residual scan is the correctness evidence "
-        f"(residual={item.get('residual_badcase_count', 0)}, residual evidence={residual_summary}). "
-        f"Prompt/backend evidence: backend={item.get('apply_provider') or 'unknown'}/{item.get('apply_model') or 'unknown'}, "
-        f"prompt_changed={bool(item.get('prompt_changed'))}, prompt_hash={item.get('before_hash') or '-'}->{item.get('after_hash') or '-'}, "
-        f"prompt edits={patch_summary}. Rerun evidence: targets={item.get('rerun_target_turns') or []}, "
-        f"errors={item.get('rerun_errors') or []}, responses={rerun_details}. {logprob_summary}"
+        f"{surface_summary} {deep_summary}"
     )
     return {
         "source_file": item.get("source_file"),
         "diagnosis": diagnosis,
+        "surface_summary": surface_summary,
+        "deep_summary": deep_summary,
         "rerun_details": rerun_details,
         "prompt_edit_summaries": prompt_edits,
         "residual_badcases": residual_cases,
         "logprob_summary": logprob_summary,
+        "logprob_interpretation": logprob_interpretation,
     }
+
+
+def _summarize_logprobs(rerun_details: list[dict[str, Any]], residual_cases: list[dict[str, Any]]) -> tuple[str, str]:
+    logprob_available = [detail for detail in rerun_details if detail["logprobs_available"]]
+    if not logprob_available:
+        return (
+            "logprobs=not available; do not attribute the outcome to token uncertainty.",
+            "no usable logprob evidence was recorded",
+        )
+    residual_turns = {case.get("turn_index") for case in residual_cases}
+    parts = []
+    interpretations = []
+    for detail in logprob_available:
+        avg = detail.get("avg_logprob")
+        minimum = detail.get("min_logprob")
+        turn = detail.get("turn")
+        if turn in residual_turns and isinstance(avg, (int, float)) and avg >= -0.2:
+            interpretation = "stable wrong-branch preference"
+        elif isinstance(minimum, (int, float)) and minimum <= -2.0:
+            interpretation = "localized token uncertainty"
+        else:
+            interpretation = "confidence evidence only"
+        interpretations.append(f"turn {turn}: {interpretation}")
+        tokens = ", ".join(
+            str(token.get("token")).strip()
+            for token in detail.get("low_confidence_tokens") or []
+            if token.get("token")
+        ) or "none"
+        parts.append(
+            f"turn {turn} avg={_format_logprob_value(avg)}, min={_format_logprob_value(minimum)}, request={detail.get('request_id') or 'none'}, "
+            f"read={interpretation}, low_tokens={tokens}"
+        )
+    return (
+        "logprobs: " + "; ".join(parts)
+        + ". Logprobs support confidence/routing diagnosis only; residual scan remains correctness evidence.",
+        "; ".join(interpretations),
+    )
+
+
+def _format_logprob_value(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        return f"{value:.3g}"
+    return str(value)
 
 
 def _truncate_conclusion_text(text: str, limit: int) -> str:
@@ -1837,24 +1850,15 @@ def render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
         "",
     ]
     for item in conclusion.get("files") or []:
+        file_name = Path(str(item.get("source_file") or "unknown")).name
         lines.extend(
             [
-                f"- `{item.get('source_file')}`",
-                f"  - updated_file: `{item.get('updated_file')}`",
-                f"  - scan/apply/residual: `{item.get('scan_event_id')}` / `{item.get('apply_event_id')}` / `{item.get('residual_scan_event_id')}`",
-                f"  - backend: `{item.get('apply_provider') or 'unknown'}` / `{item.get('apply_model') or 'unknown'}`",
-                f"  - prompt: changed=`{item.get('prompt_changed', False)}`, hash `{item.get('before_hash') or '-'}` -> `{item.get('after_hash') or '-'}`",
-                f"  - rerun_target_turns: {', '.join(str(turn) for turn in item.get('rerun_target_turns') or []) or 'none'}",
-                f"  - rerun_errors: {len(item.get('rerun_errors') or [])}",
-                f"  - applied: {item.get('applied_case_count', 0)}, fixed: {item.get('fixed_case_count', 0)}, residual: {item.get('residual_badcase_count', 0)}, unsupported: {len(item.get('unsupported_cases') or [])}",
-                f"  - failure_categories: {format_failure_category_counts(item.get('failure_category_counts') or {})}",
+                (
+                    f"- `{file_name}`: updated=`{item.get('updated_file')}`, "
+                    f"rounds=`{item.get('scan_event_id')}` / `{item.get('apply_event_id')}` / `{item.get('residual_scan_event_id')}`"
+                ),
             ]
         )
-        for failure in item.get("verification_failures") or []:
-            lines.append(
-                f"  - verification_failure `{failure.get('case_id')}` -> residual `{failure.get('residual_case_id')}`: "
-                f"{failure.get('reason') or failure.get('failure_category')}; evidence: {failure.get('residual_evidence') or 'none'}"
-            )
     lines.extend(
         [
             "",
@@ -1907,43 +1911,44 @@ def format_failure_category_counts(counts: dict[str, int]) -> str:
 
 def format_failure_category_counts_zh(counts: dict[str, int]) -> str:
     if not counts:
-        return "鏃?
-    return "锛?.join(
-        f"{failure_category_label_zh(key)}={value} 涓?
+        return "无"
+    return "，".join(
+        f"{failure_category_label_zh(key)}={value} 个"
         for key, value in sorted(counts.items())
     )
 
 
 def format_failure_category_lines_zh(counts: dict[str, int]) -> list[str]:
     if not counts:
-        return ["- 鏃?]
+        return ["- 无"]
     return [
-        f"- {failure_category_label_zh(key)}锛坄{key}`锛夛細{value} 涓€倇failure_category_description_zh(key)}"
+        f"- {failure_category_label_zh(key)}（`{key}`）：{value} 个。{failure_category_description_zh(key)}"
         for key, value in sorted(counts.items())
     ]
 
 
 def failure_category_label_zh(category: Any) -> str:
     labels = {
-        "fixable_by_prompt_clarification": "鍙€氳繃鏄庣‘ system prompt 淇",
-        "unsupported_by_missing_ground_truth": "缂哄皯鍙‘瀹氫慨澶嶄緷鎹?,
-        "backend_failed_to_patch": "鍚庣鏈敓鎴愬彲鐢?prompt patch",
-        "patch_applied_but_failed_verification": "宸叉敼鍔ㄤ絾 residual scan 鏈€氳繃",
-        "likely_model_or_context_limited": "鐤戜技妯″瀷鎴栦笂涓嬫枃鑳藉姏闄愬埗",
+        "fixable_by_prompt_clarification": "可通过澄清 system prompt 修复",
+        "unsupported_by_missing_ground_truth": "缺少必要事实，无法自动修复",
+        "backend_failed_to_patch": "后端未生成可用 prompt patch",
+        "backend_failed_to_autonomously_repair": "后端未能自动修复",
+        "patch_applied_but_failed_verification": "已改动但 residual scan 未通过",
+        "likely_model_or_context_limited": "疑似模型或上下文能力限制",
     }
-    return labels.get(str(category or "unknown"), "鏈煡鍒嗙被")
+    return labels.get(str(category or "unknown"), "未知失败类型")
 
 
 def failure_category_description_zh(category: Any) -> str:
     descriptions = {
-        "fixable_by_prompt_clarification": "瑙勫垯鏂瑰悜瀛樺湪锛屼絾 prompt 杩樹笉澶熸槑纭€佸彲鎵ц鎴栧彲楠屾敹銆?,
-        "unsupported_by_missing_ground_truth": "缂哄皯 exact message銆佺儹绾裤€佹棩鏈熴€侀噾棰濄€佸伐鍏风粨鏋滄垨涓氬姟鍐崇瓥绛夊繀瑕佷俊鎭紝batch 涓嶈兘鑷缂栭€犮€?,
-        "backend_failed_to_patch": "apply 妯″瀷娌℃湁杩斿洖绗﹀悎 JSON/patch contract 鐨勫彲搴旂敤 prompt 淇敼銆?,
-        "patch_applied_but_failed_verification": "prompt edit 鍜?鎴?targeted rerun 宸叉墽琛岋紝浣嗘洿鏂板悗鐨勫璇濅粛瑙﹀彂鍚岀被 badcase銆?,
-        "likely_model_or_context_limited": "鍙湁鍦ㄥ杞彈鎺у疄楠屽悗浠嶅け璐ワ紝涓?prompt/metadata 宸茶冻澶熸槑纭椂鎵嶄娇鐢ㄣ€?,
+        "fixable_by_prompt_clarification": "规则或优先级边界不够清楚，适合用有界 prompt 澄清修复。",
+        "unsupported_by_missing_ground_truth": "缺少 exact message、工具结果、日期、金额、热线或业务决策等必要信息，batch 不能自行编造。",
+        "backend_failed_to_patch": "apply 后端未能产出符合 JSON/patch contract 的可用 prompt 改动。",
+        "backend_failed_to_autonomously_repair": "所有适用的自动修复策略都失败，需要保留 residual badcase 供人工复核。",
+        "patch_applied_but_failed_verification": "prompt edit 或 targeted rerun 已执行，但 residual scan 仍发现同类违规。",
+        "likely_model_or_context_limited": "仅在多轮受控实验后，且 prompt/metadata 已足够明确时使用。",
     }
-    return descriptions.get(str(category or "unknown"), "褰撳墠鍒嗙被娌℃湁棰勮璇存槑銆?)
-
+    return descriptions.get(str(category or "unknown"), "请查看记录的 residual evidence 和 failure category。")
 
 def new_batch_id(prefix: str) -> str:
     return f"{prefix}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"

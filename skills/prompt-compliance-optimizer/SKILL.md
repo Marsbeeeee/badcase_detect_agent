@@ -84,12 +84,18 @@ If all applicable strategies fail, report `backend_failed_to_autonomously_repair
 - Overwrite those stable files on each run. Do not create batch-id-named output files or batch-id-named subdirectories.
 - Clean stale generated snapshots before writing new ones. Historical traceability belongs in `logs/optimization_rounds.jsonl`, not in accumulated review/apply files.
 
+## Encoding Integrity
+
+- Keep repository Python, Markdown, JSON, and JSONL files valid UTF-8 with LF endings.
+- If source text shows mojibake or unterminated string literals, repair the damaged helper or prompt text before running scan/apply.
+- After repairing encoding-sensitive code, run `python -m py_compile` on the changed module and the focused batch tests.
+
 ## Required Conclusion
 
 After every approved Apply cycle, return exactly three semantic parts:
 
 1. `Verification verdict`: state whether the approved badcases were actually fixed, partially fixed, or not fixed. Treat the residual scan as source of truth.
-2. `Badcase diagnosis and backend evidence`: explain what behavior was wrong and connect it to prompt diff/hash, backend/model, rerun results/errors, tool state, and residual evidence.
+2. `Badcase diagnosis and backend evidence`: lead with natural-language `Root cause analysis` that explains why the model reached the wrong or verified conclusion. Then preserve supporting data as `Evidence data (surface)` for visible behavior/residual scan results and `Evidence data (deep)` for prompt hash/diff, backend/model, request ids, rerun state, tool state, and logprob interpretation. Do not dump full rerun arrays or long raw evidence in Markdown.
 3. `Next action`: give the single best action for the verified state. Stop when verified; otherwise target the recorded failure category or missing ground truth.
 
 Never equate `prompt_changed` or `rerun_attempted` with successful repair.

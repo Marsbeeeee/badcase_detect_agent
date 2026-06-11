@@ -19,7 +19,13 @@ Treat residual scan and observable target behavior as correctness evidence. Prom
 
 ### 2. Badcase Diagnosis And Backend Evidence
 
-Explain the violated behavior and why it likely persisted. Connect:
+Keep this section concise, causal, and evidence-layered. Explain why the model reached the conclusion before listing the data. Use three visible layers:
+
+- `Root cause analysis`: natural-language diagnosis of the likely branch-priority, routing, exact-message, tool, or missing-ground-truth cause. This is what humans should read first.
+- `Evidence data (surface)`: user-visible behavior, residual verdict, file/turn/case ids, and the old-vs-new behavior difference.
+- `Evidence data (deep)`: backend/model, prompt hash/diff summary, request ids, rerun targets/errors, tool state, and summarized logprob interpretation.
+
+Connect:
 
 - residual `error_type` and evidence
 - old versus rerun response behavior
@@ -27,6 +33,8 @@ Explain the violated behavior and why it likely persisted. Connect:
 - backend provider/model, request ids, rerun targets, errors, and tool-call state
 - source meta when available
 - logprob summary when available
+
+Do not paste full rerun response arrays, full token lists, or long residual evidence into Markdown. Truncate examples and keep the complete machine-readable detail in the JSON conclusion. The data should support the root-cause prose, not replace it.
 
 Interpret logprobs carefully:
 

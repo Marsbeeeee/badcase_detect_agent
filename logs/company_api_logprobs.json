@@ -4,15 +4,92 @@
     "top_logprobs_requested": 5,
     "retry_without_logprobs": false,
     "available": true,
-    "content_token_count": 41,
-    "scored_token_count": 41,
-    "avg_logprob": -0.0034798801672167893,
-    "min_logprob": -0.14267508685588837,
+    "content_token_count": 42,
+    "scored_token_count": 42,
+    "avg_logprob": -0.020414316938036962,
+    "min_logprob": -0.42870065569877625,
     "low_confidence_tokens": [
       {
-        "token": " menarik",
-        "logprob": -0.14267508685588837,
+        "token": " meng",
+        "logprob": -0.42870065569877625,
         "top_logprobs": [
+          {
+            "token": " meng",
+            "bytes": [
+              32,
+              109,
+              101,
+              110,
+              103
+            ],
+            "logprob": -0.42870065569877625
+          },
+          {
+            "token": " sebelumnya",
+            "bytes": [
+              32,
+              115,
+              101,
+              98,
+              101,
+              108,
+              117,
+              109,
+              110,
+              121,
+              97
+            ],
+            "logprob": -1.0537006855010986
+          },
+          {
+            "token": "<bos>",
+            "bytes": [
+              60,
+              98,
+              111,
+              115,
+              62
+            ],
+            "logprob": -9999.0
+          },
+          {
+            "token": "<eos>",
+            "bytes": [
+              60,
+              101,
+              111,
+              115,
+              62
+            ],
+            "logprob": -9999.0
+          },
+          {
+            "token": "<pad>",
+            "bytes": [
+              60,
+              112,
+              97,
+              100,
+              62
+            ],
+            "logprob": -9999.0
+          }
+        ]
+      },
+      {
+        "token": " nar",
+        "logprob": -0.42870065569877625,
+        "top_logprobs": [
+          {
+            "token": " nar",
+            "bytes": [
+              32,
+              110,
+              97,
+              114
+            ],
+            "logprob": -0.42870065569877625
+          },
           {
             "token": " menarik",
             "bytes": [
@@ -25,17 +102,7 @@
               105,
               107
             ],
-            "logprob": -0.14267508685588837
-          },
-          {
-            "token": " nar",
-            "bytes": [
-              32,
-              110,
-              97,
-              114
-            ],
-            "logprob": -2.0176751613616943
+            "logprob": -1.0537006855010986
           },
           {
             "token": "<bos>",
@@ -201,67 +268,6 @@
               97,
               97,
               102
-            ],
-            "logprob": 0.0
-          },
-          {
-            "token": "<bos>",
-            "bytes": [
-              60,
-              98,
-              111,
-              115,
-              62
-            ],
-            "logprob": -9999.0
-          },
-          {
-            "token": "<pad>",
-            "bytes": [
-              60,
-              112,
-              97,
-              100,
-              62
-            ],
-            "logprob": -9999.0
-          },
-          {
-            "token": "<unk>",
-            "bytes": [
-              60,
-              117,
-              110,
-              107,
-              62
-            ],
-            "logprob": -9999.0
-          },
-          {
-            "token": "<eos>",
-            "bytes": [
-              60,
-              101,
-              111,
-              115,
-              62
-            ],
-            "logprob": -9999.0
-          }
-        ]
-      },
-      {
-        "token": " meng",
-        "logprob": 0.0,
-        "top_logprobs": [
-          {
-            "token": " meng",
-            "bytes": [
-              32,
-              109,
-              101,
-              110,
-              103
             ],
             "logprob": 0.0
           },
@@ -936,7 +942,7 @@
           110,
           103
         ],
-        "logprob": 0.0,
+        "logprob": -0.42870065569877625,
         "top_logprobs": [
           {
             "token": " meng",
@@ -947,7 +953,24 @@
               110,
               103
             ],
-            "logprob": 0.0
+            "logprob": -0.42870065569877625
+          },
+          {
+            "token": " sebelumnya",
+            "bytes": [
+              32,
+              115,
+              101,
+              98,
+              101,
+              108,
+              117,
+              109,
+              110,
+              121,
+              97
+            ],
+            "logprob": -1.0537006855010986
           },
           {
             "token": "<bos>",
@@ -961,34 +984,23 @@
             "logprob": -9999.0
           },
           {
-            "token": "<pad>",
-            "bytes": [
-              60,
-              112,
-              97,
-              100,
-              62
-            ],
-            "logprob": -9999.0
-          },
-          {
-            "token": "<unk>",
-            "bytes": [
-              60,
-              117,
-              110,
-              107,
-              62
-            ],
-            "logprob": -9999.0
-          },
-          {
             "token": "<eos>",
             "bytes": [
               60,
               101,
               111,
               115,
+              62
+            ],
+            "logprob": -9999.0
+          },
+          {
+            "token": "<pad>",
+            "bytes": [
+              60,
+              112,
+              97,
+              100,
               62
             ],
             "logprob": -9999.0
@@ -2048,19 +2060,25 @@
         ]
       },
       {
-        "token": " menarik",
+        "token": " nar",
         "bytes": [
           32,
-          109,
-          101,
           110,
           97,
-          114,
-          105,
-          107
+          114
         ],
-        "logprob": -0.14267508685588837,
+        "logprob": -0.42870065569877625,
         "top_logprobs": [
+          {
+            "token": " nar",
+            "bytes": [
+              32,
+              110,
+              97,
+              114
+            ],
+            "logprob": -0.42870065569877625
+          },
           {
             "token": " menarik",
             "bytes": [
@@ -2073,17 +2091,7 @@
               105,
               107
             ],
-            "logprob": -0.14267508685588837
-          },
-          {
-            "token": " nar",
-            "bytes": [
-              32,
-              110,
-              97,
-              114
-            ],
-            "logprob": -2.0176751613616943
+            "logprob": -1.0537006855010986
           },
           {
             "token": "<bos>",
@@ -2114,6 +2122,68 @@
               112,
               97,
               100,
+              62
+            ],
+            "logprob": -9999.0
+          }
+        ]
+      },
+      {
+        "token": "ik",
+        "bytes": [
+          105,
+          107
+        ],
+        "logprob": 0.0,
+        "top_logprobs": [
+          {
+            "token": "ik",
+            "bytes": [
+              105,
+              107
+            ],
+            "logprob": 0.0
+          },
+          {
+            "token": "<bos>",
+            "bytes": [
+              60,
+              98,
+              111,
+              115,
+              62
+            ],
+            "logprob": -9999.0
+          },
+          {
+            "token": "<pad>",
+            "bytes": [
+              60,
+              112,
+              97,
+              100,
+              62
+            ],
+            "logprob": -9999.0
+          },
+          {
+            "token": "<unk>",
+            "bytes": [
+              60,
+              117,
+              110,
+              107,
+              62
+            ],
+            "logprob": -9999.0
+          },
+          {
+            "token": "<eos>",
+            "bytes": [
+              60,
+              101,
+              111,
+              115,
               62
             ],
             "logprob": -9999.0
@@ -2927,28 +2997,26 @@
         ]
       },
       {
-        "token": " sebaik",
+        "token": " lebih",
         "bytes": [
           32,
-          115,
+          108,
           101,
           98,
-          97,
           105,
-          107
+          104
         ],
         "logprob": 0.0,
         "top_logprobs": [
           {
-            "token": " sebaik",
+            "token": " lebih",
             "bytes": [
               32,
-              115,
+              108,
               101,
               98,
-              97,
               105,
-              107
+              104
             ],
             "logprob": 0.0
           },
@@ -2999,20 +3067,24 @@
         ]
       },
       {
-        "token": "nya",
+        "token": " baik",
         "bytes": [
-          110,
-          121,
-          97
+          32,
+          98,
+          97,
+          105,
+          107
         ],
         "logprob": 0.0,
         "top_logprobs": [
           {
-            "token": "nya",
+            "token": " baik",
             "bytes": [
-              110,
-              121,
-              97
+              32,
+              98,
+              97,
+              105,
+              107
             ],
             "logprob": 0.0
           },
@@ -3468,8 +3540,8 @@
       }
     ]
   },
-  "request_id": "af0e2b9d54",
-  "timestamp": "2026-06-11T09:37:46.300428+00:00",
+  "request_id": "71b960f0d1",
+  "timestamp": "2026-06-11T09:53:46.662310+00:00",
   "purpose": "targeted_rerun",
   "provider": "openai_api_like",
   "model": "voyager-1.6-preview-run27m4a8b4-r3",

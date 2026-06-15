@@ -148,6 +148,35 @@ def test_normalizes_top_level_message_list() -> None:
     assert result.data.system_prompt == "Follow policy."
 
 
+def test_normalizes_first_conversation_from_top_level_record_list() -> None:
+    raw = """
+    [
+      {
+        "system_prompt": "Follow first policy.",
+        "interactions": [
+          {"role": "user", "content": "First question"},
+          {"role": "assistant", "content": "First answer"}
+        ]
+      },
+      {
+        "system_prompt": "Follow second policy.",
+        "interactions": [
+          {"role": "user", "content": "Second question"},
+          {"role": "assistant", "content": "Second answer"}
+        ]
+      }
+    ]
+    """
+
+    result = parse_conversation_json(raw)
+
+    assert result.error is None
+    assert result.data is not None
+    assert result.data.system_prompt == "Follow first policy."
+    assert result.data.interactions[0].content == "First question"
+    assert "Detected a list of records. Loaded the first record." in result.warnings
+
+
 def test_normalizes_company_compress_dialog_shape() -> None:
     raw = """
     {

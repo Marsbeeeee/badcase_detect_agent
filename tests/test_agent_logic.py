@@ -30,7 +30,7 @@ from prompt_optimizer_agent.json_utils import ConversationData, Interaction, par
 
 
 def test_default_company_model_is_voyager() -> None:
-    assert agent_logic.DEFAULT_COMPANY_MODEL == "voyager-1.6-preview-run27m4a8b4-r3"
+    assert agent_logic.DEFAULT_COMPANY_MODEL == "voyager-1.6-gemma4-26b-a4b-it"
 
 
 def test_parse_judge_bad_case_uses_explicit_turn_index() -> None:
@@ -508,6 +508,46 @@ def test_openai_chat_text_passes_tools_and_renders_tool_call() -> None:
     ]
     assert captured_request["tool_choice"] == "auto"
     assert content == '<function-call>MandiriCX_Call_Center_search_promotion:{"query":"personal loan"}</function-call>'
+
+
+def test_company_chat_text_normalizes_tool_messages_before_send() -> None:
+    old_generate = agent_logic.generate_with_company_demo
+    captured_request = {}
+
+    def fake_generate_with_company_demo(**kwargs):
+        captured_request.update(kwargs)
+        return "ok"
+
+    agent_logic.generate_with_company_demo = fake_generate_with_company_demo
+    try:
+        content = agent_logic._chat_text(
+            settings=LLMSettings(
+                backend="company_api",
+                model="m",
+                provider="open_router",
+                base_url="http://example.test",
+            ),
+            messages=[
+                {"role": "system", "content": "Use context."},
+                {"role": "user", "content": "lookup"},
+                {"role": "assistant", "content": "<function-call>lookup:{}</function-call>"},
+                {"role": "tool", "content": '{"status":"not_executed"}'},
+                {"role": "user", "content": "continue"},
+            ],
+            purpose="targeted_rerun",
+        )
+    finally:
+        agent_logic.generate_with_company_demo = old_generate
+
+    assert content == "ok"
+    assert [message["role"] for message in captured_request["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "user",
+    ]
+    assert captured_request["messages"][3]["content"].startswith("[tool output]\n")
 
 
 def test_rerun_conversation_passes_normalized_upload_tools() -> None:
@@ -1369,6 +1409,62 @@ def test_deterministic_conclusion_does_not_equate_prompt_change_with_fix() -> No
     assert "Residual badcases remain" in paragraphs[2]
 
 
+def test_deterministic_conclusion_stops_prompt_only_after_repeated_residual_versions() -> None:
+    residual_case = BadCase(
+        turn_index=9,
+        role="assistant",
+        error_type="late_payment_proposal_not_rtp_closing",
+        evidence="Still negotiated after a late date.",
+        recommendation="Close immediately.",
+    )
+    prompt_versions = [
+        {
+            "label": "v0 Original",
+            "scan_trace_recorded": True,
+            "scan_trace_cases": [
+                {
+                    "turn_index": 9,
+                    "role": "assistant",
+                    "error_type": "late_payment_proposal_not_rtp_closing",
+                }
+            ],
+        },
+        {
+            "label": "v1 Apply",
+            "scan_trace_recorded": True,
+            "scan_trace_cases": [
+                {
+                    "turn_index": 9,
+                    "role": "assistant",
+                    "error_type": "late_payment_proposal_not_rtp_closing",
+                }
+            ],
+        },
+        {"label": "v2 Apply", "scan_trace_recorded": False, "scan_trace_cases": []},
+    ]
+
+    conclusion = _deterministic_experiment_conclusion(
+        before_prompt="old",
+        optimized_prompt="new",
+        rerun_results=[
+            RerunTurn(
+                user_turn_index=8,
+                assistant_turn_index=9,
+                user_message="I can pay after the maximum date.",
+                old_assistant_response="When can you pay?",
+                new_assistant_response="Can you pay earlier?",
+            )
+        ],
+        post_rerun_bad_cases=[residual_case],
+        applied_feedback_summary="Added another late-date resolver.",
+        post_rerun_scan_status="completed",
+        prompt_version_history=prompt_versions,
+    )
+
+    assert "prompt-only repair as saturated" in conclusion
+    assert "deterministic conversation replacement" in conclusion
+
+
 def test_experiment_diagnostic_evidence_exposes_non_surface_signals() -> None:
     data = ConversationData(
         system_prompt="Follow flow.",
@@ -1438,6 +1534,76 @@ def test_experiment_diagnostic_evidence_uses_available_logprobs() -> None:
     assert diagnostics["token_probability"]["available"] is True
     assert diagnostics["token_probability"]["avg_logprob_by_turn"] == [-0.3]
     assert diagnostics["token_probability"]["low_confidence_tokens"][0]["token"] == "new"
+
+
+def test_experiment_diagnostic_evidence_exposes_response_metadata() -> None:
+    data = ConversationData(
+        system_prompt="Follow flow.",
+        interactions=[Interaction(role="user", content="Hi")],
+    )
+    diagnostics = _experiment_diagnostic_evidence(
+        data=data,
+        rerun_results=[
+            RerunTurn(
+                user_turn_index=0,
+                assistant_turn_index=1,
+                user_message="Hi",
+                old_assistant_response="old",
+                new_assistant_response="new",
+                response_diagnostics={
+                    "request_id": "abc123",
+                    "purpose": "targeted_rerun",
+                    "provider": "open_router",
+                    "model": "google/gemma-4-26b-a4b-it",
+                    "response_meta": {
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.0001},
+                        "response_keys": ["content", "logprobs", "usage"],
+                    },
+                    "logprobs": {
+                        "requested": True,
+                        "available": False,
+                        "reason": "Company API returned an empty logprobs list.",
+                    },
+                },
+            )
+        ],
+        post_rerun_bad_cases=[],
+        post_rerun_scan_status="completed",
+    )
+
+    assert diagnostics["token_probability"]["available"] is False
+    assert diagnostics["response_metadata"]["available"] is True
+    assert diagnostics["response_metadata"]["items"][0]["request_id"] == "abc123"
+    assert diagnostics["response_metadata"]["items"][0]["response_meta"]["usage"]["cost"] == 0.0001
+
+
+def test_deterministic_conclusion_mentions_requested_but_unavailable_logprobs() -> None:
+    conclusion = _deterministic_experiment_conclusion(
+        before_prompt="Follow flow.",
+        optimized_prompt="Follow flow. Close on late payment dates.",
+        rerun_results=[
+            RerunTurn(
+                user_turn_index=0,
+                assistant_turn_index=1,
+                user_message="I can pay on the 30th.",
+                old_assistant_response="Can you pay earlier?",
+                new_assistant_response="Thank you. <dialog-end>",
+                response_diagnostics={
+                    "logprobs": {
+                        "requested": True,
+                        "available": False,
+                        "reason": "Company API returned an empty logprobs list.",
+                    }
+                },
+            )
+        ],
+        post_rerun_bad_cases=[],
+        applied_feedback_summary="Added late-date terminal priority rules.",
+        post_rerun_scan_status="completed",
+    )
+
+    assert "Token logprobs were requested but are unavailable for analysis" in conclusion
+    assert "Company API returned an empty logprobs list" in conclusion
 
 
 def test_experiment_diagnostic_evidence_tolerates_legacy_rerun_results() -> None:
@@ -1543,6 +1709,57 @@ def test_build_conclusion_payload_marks_rerun_only_when_prompt_unchanged() -> No
     assert changes["prompt_changed"] is False
     assert changes["prompt_diff"] == ""
     assert "conversation-only" in changes["instruction"]
+
+
+def test_build_conclusion_payload_marks_likely_prompt_only_saturation() -> None:
+    residual_case = BadCase(
+        turn_index=9,
+        role="assistant",
+        error_type="ptp_attempt_limit_exceeded",
+        evidence="Still asked another payment-date question after the attempt limit.",
+        recommendation="Close immediately after the third failed attempt.",
+    )
+    payload = _build_conclusion_payload(
+        data=ConversationData(
+            system_prompt="Close after three failed proposal attempts.",
+            interactions=[Interaction(role="user", content="Still cannot pay.")],
+        ),
+        before_prompt="Close after three failed proposal attempts.",
+        optimized_prompt="Close after three failed proposal attempts. Close immediately.",
+        rerun_results=[
+            RerunTurn(
+                user_turn_index=8,
+                assistant_turn_index=9,
+                user_message="Still cannot pay.",
+                old_assistant_response="When can you pay?",
+                new_assistant_response="Please suggest a payment date.",
+            )
+        ],
+        updated_interactions=[Interaction(role="user", content="Still cannot pay.")],
+        post_rerun_bad_cases=[residual_case],
+        applied_feedback_summary="Added stricter attempt-limit wording.",
+        post_rerun_scan_status="completed",
+        prompt_version_history=[
+            {
+                "label": "v0 Original",
+                "scan_trace_recorded": True,
+                "scan_trace_cases": [{"turn_index": 9, "error_type": "ptp_attempt_limit_exceeded"}],
+            },
+            {
+                "label": "v1 Apply",
+                "scan_trace_recorded": True,
+                "scan_trace_cases": [{"turn_index": 9, "error_type": "ptp_attempt_limit_exceeded"}],
+            },
+            {"label": "v2 Apply", "scan_trace_recorded": False, "scan_trace_cases": []},
+        ],
+    )
+
+    next_inputs = payload["paragraph_inputs"]["paragraph_3_next_recommendation"]
+    repair_saturation = next_inputs["repair_saturation"]
+
+    assert repair_saturation["status"] == "likely_not_fixable_by_prompt_only"
+    assert repair_saturation["likely_not_fixable_by_prompt_only"] is True
+    assert any("prompt-only repair is saturated" in hint for hint in next_inputs["observed_root_cause_hints"])
 
 
 def test_write_conclusion_dialog_log_exports_compress_dialog() -> None:

@@ -1,8 +1,26 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+=3.9.0
+
+# Python environments and generated files
 .deps/
-.DS_Store
-__pycache__/
-*.pyc
 .venv/
 .venv*/
-outputs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pycache_tmp/
+.tmp_uv/
+.uv_cache/
+
+# Runtime output and build artifacts
 logs/
+outputs/
+dist/
+build/
+
+# Editor and OS files
+.DS_Store
+.vscode/

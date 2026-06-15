@@ -22,7 +22,7 @@ from prompt_optimizer_agent.json_utils import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_COMPANY_URL = os.getenv("COMPANY_LLM_URL", "http://192.168.101.15:9898")
 DEFAULT_COMPANY_PROVIDER = os.getenv("COMPANY_LLM_PROVIDER", "openai_api_like")
-DEFAULT_COMPANY_MODEL = os.getenv("COMPANY_LLM_MODEL", "voyager-1.6-preview-run27m4a8b4-r3")
+DEFAULT_COMPANY_MODEL = os.getenv("COMPANY_LLM_MODEL", "voyager-1.6-gemma4-26b-a4b-it")
 AUTO_RERUN_CONTEXT_WINDOW = -1
 AUTO_RERUN_CONTEXT_CHAR_BUDGET = 12000
 AUTO_RERUN_CONTEXT_MIN_MESSAGES = 6

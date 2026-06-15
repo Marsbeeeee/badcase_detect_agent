@@ -9,8 +9,8 @@ from prompt_optimizer_agent.rerun_logprobs import (
 
 
 def test_default_company_model_is_voyager() -> None:
-    assert rerun_logprobs.DEFAULT_COMPANY_MODEL == "voyager-1.6-preview-run27m4a8b4-r3"
-    assert RerunLogprobsSettings().model == "voyager-1.6-preview-run27m4a8b4-r3"
+    assert rerun_logprobs.DEFAULT_COMPANY_MODEL == "voyager-1.6-gemma4-26b-a4b-it"
+    assert RerunLogprobsSettings().model == "voyager-1.6-gemma4-26b-a4b-it"
 
 
 def test_parse_turn_specs_accepts_lists_and_ranges() -> None:

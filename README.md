@@ -12,6 +12,9 @@ Prompt Optimizer Agent 是一个 Streamlit 工具，用来检查对话是否严�
 
 ## Quick Start
 
+Do not store API keys in repository files. Use environment variables or an untracked `.env`
+file, and rotate any key that has previously been committed.
+
 ```bash
 cd /Users/zlshlt2501003/Desktop/prompt_optimizer_agent
 python3 -m venv .venv39
@@ -23,6 +26,22 @@ streamlit run app.py
 ```bash
 cd C:\Users\ZLSHLT2604010\Desktop\badcase_detect_agent
 .\.venv312\Scripts\streamlit.exe run app.py
+```
+
+For a clean Windows setup:
+
+```powershell
+cd C:\Users\ZLSHLT2604010\Desktop\badcase_detect_agent
+py -3.12 -m venv .venv312
+.\.venv312\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv312\Scripts\streamlit.exe run app.py
+```
+
+Install the development dependencies before running tests:
+
+```powershell
+.\.venv312\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv312\Scripts\python.exe -m pytest tests -q
 ```
 
 ## Codex Skill Sync
@@ -66,7 +85,7 @@ export PROMPT_OPTIMIZER_MODEL="gpt-4o-mini"
 ```bash
 export COMPANY_LLM_URL="http://192.168.101.15:9898"
 export COMPANY_LLM_PROVIDER="openai_api_like"
-export COMPANY_LLM_MODEL="voyager-1.6-preview-run27m4a8b4-r3"
+export COMPANY_LLM_MODEL="voyager-1.6-gemma4-26b-a4b-it"
 ```
 
 ## Supported Data
@@ -308,7 +327,7 @@ python /Users/zlshlt2501003/Downloads/generate_from_chat_demo_server.py \
   --url http://192.168.101.15:9898 \
   --max-tokens 512 \
   --temperature 0.1 \
-  --models openai_api_like:voyager-1.6-preview-run27m4a8b4-r3
+  --models openai_api_like:voyager-1.6-gemma4-26b-a4b-it
 ```
 
 如果脚本所在环境支持 token logprob，可在该脚本或服务端参数里打开对应 logprob 选项；本项目导出的 dialog 已经是完整 conclusion 请求上下文。

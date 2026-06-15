@@ -163,11 +163,11 @@ def _normalize_conversation_shape(raw_data: Any, warnings: list[str]) -> Any:
     if isinstance(raw_data, list):
         if raw_data and all(isinstance(item, dict) and _message_content(item) for item in raw_data):
             warnings.append("Detected a top-level message list and converted it to the standard schema.")
-        return _messages_to_standard(
-            raw_data,
-            default_system_prompt="You are a helpful assistant.",
-            source_meta={"format": "top_level_message_list"},
-        )
+            return _messages_to_standard(
+                raw_data,
+                default_system_prompt="You are a helpful assistant.",
+                source_meta={"format": "top_level_message_list"},
+            )
         if raw_data and isinstance(raw_data[0], dict):
             warnings.append("Detected a list of records. Loaded the first record.")
             return _normalize_conversation_shape(raw_data[0], warnings)

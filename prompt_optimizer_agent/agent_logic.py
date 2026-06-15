@@ -23,7 +23,7 @@ from prompt_optimizer_agent.json_utils import ConversationData, Interaction, ren
 DEFAULT_MODEL = os.getenv("PROMPT_OPTIMIZER_MODEL", "gpt-4o-mini")
 DEFAULT_COMPANY_URL = os.getenv("COMPANY_LLM_URL", "http://192.168.101.15:9898")
 DEFAULT_COMPANY_PROVIDER = os.getenv("COMPANY_LLM_PROVIDER", "openai_api_like")
-DEFAULT_COMPANY_MODEL = os.getenv("COMPANY_LLM_MODEL", "voyager-1.6-preview-run27m4a8b4-r3")
+DEFAULT_COMPANY_MODEL = os.getenv("COMPANY_LLM_MODEL", "voyager-1.6-gemma4-26b-a4b-it")
 AUTO_RERUN_CONTEXT_WINDOW = -1
 AUTO_RERUN_CONTEXT_CHAR_BUDGET = 12000
 AUTO_RERUN_CONTEXT_MIN_MESSAGES = 6
@@ -2679,6 +2679,7 @@ def generate_experiment_conclusion(
     applied_feedback_summary: str,
     llm_settings: LLMSettings | None = None,
     post_rerun_scan_status: str = "completed",
+    prompt_version_history: list[dict[str, Any]] | None = None,
 ) -> str:
     settings = llm_settings or LLMSettings()
     failed = [result for result in rerun_results if result.error]
@@ -2709,12 +2710,19 @@ def generate_experiment_conclusion(
         "and available rerun/tool/token/backend metadata. Do not claim the response is identical when "
         "target_turn_comparisons says only wording changed; instead say wording changed but target behavior did or did "
         "not improve. Use token/logprob evidence only when token_probability.available is true. If it is false, say "
-        "there is no token-probability evidence and use behavior/meta/tool evidence. High-confidence logprobs on a "
-        "wrong response mean the backend strongly preferred the wrong behavior; they do not prove compliance.\n\n"
+        "that token logprobs were requested but are unavailable, empty, unsupported, or missing according to "
+        "token_probability.reasons, so token-probability analysis cannot be performed. Then use behavior/meta/tool "
+        "evidence instead. Treat diagnostic_evidence.response_metadata as backend execution metadata, not "
+        "token-confidence evidence. High-confidence logprobs on a wrong response mean the backend strongly preferred "
+        "the wrong behavior; they do not prove compliance.\n\n"
         "paragraph_3 must give the single best next action for the current verified state using "
         "paragraph_inputs.paragraph_3_next_recommendation. If verification passed, say to keep the version and stop. "
-        "If it failed, tie the action to the observed root cause and backend evidence. Include why, implementation "
-        "steps, acceptance criteria, and a fallback; avoid generic advice or repeating an unchanged failed experiment."
+        "If it failed, tie the action to the observed root cause and backend evidence. If repair_saturation says "
+        "unfixable_assessment_required or likely_not_fixable_by_prompt_only, explicitly assess whether another "
+        "prompt-only version is no longer justified; recommend unsupported/missing-ground-truth handling, a "
+        "deterministic conversation replacement, or a non-prompt workflow/model change instead of another generic "
+        "prompt patch. Include why, implementation steps, acceptance criteria, and a fallback; avoid generic advice "
+        "or repeating an unchanged failed experiment."
     )
     payload = _build_conclusion_payload(
         data=data,
@@ -2725,6 +2733,7 @@ def generate_experiment_conclusion(
         post_rerun_bad_cases=post_rerun_bad_cases,
         applied_feedback_summary=applied_feedback_summary,
         post_rerun_scan_status=post_rerun_scan_status,
+        prompt_version_history=prompt_version_history,
     )
     payload_json = json.dumps(payload, ensure_ascii=False)
     if len(payload_json) > 45000:
@@ -2735,6 +2744,7 @@ def generate_experiment_conclusion(
             post_rerun_bad_cases=post_rerun_bad_cases,
             applied_feedback_summary=applied_feedback_summary,
             post_rerun_scan_status=post_rerun_scan_status,
+            prompt_version_history=prompt_version_history,
         )
     messages = [
         {"role": "system", "content": conclusion_prompt},
@@ -2762,6 +2772,7 @@ def generate_experiment_conclusion(
                 post_rerun_bad_cases=post_rerun_bad_cases,
                 applied_feedback_summary=applied_feedback_summary,
                 post_rerun_scan_status=post_rerun_scan_status,
+                prompt_version_history=prompt_version_history,
             )
         return f"Conclusion generation failed: {exc}"
 
@@ -2774,6 +2785,7 @@ def _deterministic_experiment_conclusion(
     post_rerun_bad_cases: list[BadCase],
     applied_feedback_summary: str,
     post_rerun_scan_status: str,
+    prompt_version_history: list[dict[str, Any]] | None = None,
 ) -> str:
     prompt_changed = before_prompt.strip() != optimized_prompt.strip()
     target_turns = [
@@ -2781,13 +2793,14 @@ def _deterministic_experiment_conclusion(
         for result in rerun_results
         if result.assistant_turn_index is not None
     ]
-    logprob_available = any(
-        isinstance(result.response_diagnostics, dict)
-        and isinstance(result.response_diagnostics.get("logprobs"), dict)
-        and result.response_diagnostics["logprobs"].get("available") is True
-        for result in rerun_results
-    )
+    token_probability = _token_probability_diagnostics(rerun_results)
+    logprob_available = token_probability.get("available") is True
     residual_count = len(post_rerun_bad_cases)
+    repair_saturation = _prompt_repair_saturation_diagnostics(
+        prompt_version_history,
+        post_rerun_bad_cases,
+        post_rerun_scan_status,
+    )
     if post_rerun_scan_status != "completed":
         first = "Verification is incomplete because the post-rerun badcase scan did not complete."
     elif residual_count == 0:
@@ -2802,14 +2815,30 @@ def _deterministic_experiment_conclusion(
         if prompt_changed
         else "No new system-prompt version was created; the target turn was rerun with the existing prompt."
     )
-    second = (
-        f"{prompt_evidence} Token-probability evidence was {'available' if logprob_available else 'not available'}; "
-        "the residual scan is the verification source of truth."
-    )
+    if logprob_available:
+        token_evidence = "Token-probability evidence was available and can be used only as backend confidence context"
+    else:
+        unavailable_reasons = token_probability.get("reasons") or [token_probability.get("reason")]
+        reason_text = "; ".join(str(reason) for reason in unavailable_reasons if reason)
+        if reason_text:
+            token_evidence = (
+                "Token logprobs were requested but are unavailable for analysis "
+                f"({reason_text})"
+            )
+        else:
+            token_evidence = "Token logprobs are unavailable for analysis"
+    second = f"{prompt_evidence} {token_evidence}; the residual scan is the verification source of truth."
     third = (
         "The cycle is complete; keep this prompt version and do not run another scan unless requested."
         if residual_count == 0
-        else "Residual badcases remain; review the remaining traces before applying another targeted prompt patch."
+        else (
+            "Residual badcases remain after multiple prompt versions; treat prompt-only repair as saturated, "
+            "assess whether the case is unsupported or not fixable with the current model/workflow, then use a "
+            "deterministic conversation replacement or missing-ground-truth workflow with acceptance criteria of "
+            "zero residual badcases."
+            if repair_saturation.get("likely_not_fixable_by_prompt_only")
+            else "Residual badcases remain; review the remaining traces before applying another targeted prompt patch."
+        )
     )
     return "\n\n".join([first, second, third])
 
@@ -2859,6 +2888,7 @@ def _build_conclusion_payload(
     post_rerun_bad_cases: list[BadCase],
     applied_feedback_summary: str,
     post_rerun_scan_status: str,
+    prompt_version_history: list[dict[str, Any]] | None = None,
 ) -> dict[str, object]:
     prompt_diff = _prompt_unified_diff(before_prompt, optimized_prompt)
     prompt_changed = before_prompt.strip() != optimized_prompt.strip()
@@ -2872,6 +2902,11 @@ def _build_conclusion_payload(
     token_probability = diagnostic_evidence.get("token_probability", {})
     target_turn_comparisons = [_target_turn_comparison(item) for item in rerun_evidence]
     prompt_change_quality = _prompt_change_quality(before_prompt, optimized_prompt)
+    repair_saturation = _prompt_repair_saturation_diagnostics(
+        prompt_version_history,
+        post_rerun_bad_cases,
+        post_rerun_scan_status,
+    )
     return {
         "output_contract": {
             "format": {
@@ -2910,21 +2945,25 @@ def _build_conclusion_payload(
                     "Do not say old and new responses are identical unless exact_text_changed is false.",
                     "If exact_text_changed is true but approximate_similarity is high, say wording changed and judge the behavior.",
                     "Use token probability only when available is true; otherwise say there is no token-probability evidence.",
+                    "If token probability is unavailable, mention whether logprobs were requested and cite the unavailable reason.",
                     "Prefer behavior, tool-call state, metadata, and residual scan evidence over prompt wording alone.",
                 ],
             },
             "paragraph_3_next_recommendation": {
+                "repair_saturation": repair_saturation,
                 "observed_root_cause_hints": _conclusion_root_cause_hints(
                     target_turn_comparisons=target_turn_comparisons,
                     prompt_change_quality=prompt_change_quality,
                     token_probability=token_probability,
                     post_rerun_bad_cases=post_rerun_bad_cases,
                     post_rerun_scan_status=post_rerun_scan_status,
+                    repair_saturation=repair_saturation,
                 ),
                 "recommendation_rules": [
                     "Recommend one concrete prompt or workflow edit.",
                     "If the current edit duplicated abstract guidance, recommend replacing it with a concrete response pattern.",
                     "If rerun behavior still misses the required action, recommend an explicit branch/action gate.",
+                    "If repair_saturation.likely_not_fixable_by_prompt_only is true, do not recommend another prompt-only patch unless new evidence changes the experiment; recommend unsupported/missing-ground-truth handling, deterministic replacement, workflow/tool correction, or model/backend escalation.",
                 ],
             },
         },
@@ -2957,6 +2996,7 @@ def _truncate_for_conclusion(text: str, limit: int = 5000) -> str:
 def _rerun_result_summary(result: RerunTurn) -> dict[str, object]:
     diagnostics = result.response_diagnostics or {}
     logprobs = diagnostics.get("logprobs") if isinstance(diagnostics, dict) else None
+    response_meta = diagnostics.get("response_meta") if isinstance(diagnostics, dict) else None
     return {
         "user_turn_index": result.user_turn_index,
         "assistant_turn_index": result.assistant_turn_index,
@@ -2964,6 +3004,7 @@ def _rerun_result_summary(result: RerunTurn) -> dict[str, object]:
         "new_assistant_response_preview": _truncate_for_conclusion(result.new_assistant_response, limit=1200),
         "error": result.error,
         "logprobs": logprobs,
+        "response_meta": response_meta,
     }
 
 
@@ -3032,6 +3073,85 @@ def _prompt_change_quality(before_prompt: str, optimized_prompt: str) -> dict[st
     }
 
 
+def _prompt_repair_saturation_diagnostics(
+    prompt_version_history: list[dict[str, Any]] | None,
+    post_rerun_bad_cases: list[BadCase],
+    post_rerun_scan_status: str,
+) -> dict[str, object]:
+    versions = [version for version in (prompt_version_history or []) if isinstance(version, dict)]
+    residual_count = len(post_rerun_bad_cases)
+    applied_version_count = max(0, len(versions) - 1)
+    scan_trace_items: list[dict[str, object]] = []
+    for version in versions:
+        label = str(version.get("label") or "")
+        scan_cases = version.get("scan_trace_cases") or []
+        if not isinstance(scan_cases, list):
+            continue
+        for item in scan_cases:
+            if isinstance(item, dict):
+                scan_trace_items.append(
+                    {
+                        "version_label": label,
+                        "turn_index": item.get("turn_index"),
+                        "error_type": item.get("error_type"),
+                    }
+                )
+    residual_error_types = sorted({case.error_type for case in post_rerun_bad_cases})
+    residual_turn_error_keys = {
+        (case.turn_index, case.error_type)
+        for case in post_rerun_bad_cases
+    }
+    repeated_error_type_counts = {
+        error_type: 1
+        + sum(1 for item in scan_trace_items if item.get("error_type") == error_type)
+        for error_type in residual_error_types
+    }
+    repeated_turn_error_counts = {
+        f"{turn_index}:{error_type}": 1
+        + sum(
+            1
+            for item in scan_trace_items
+            if item.get("turn_index") == turn_index and item.get("error_type") == error_type
+        )
+        for turn_index, error_type in residual_turn_error_keys
+    }
+    unfixable_assessment_required = (
+        post_rerun_scan_status == "completed"
+        and residual_count > 0
+        and applied_version_count >= 2
+    )
+    repeated_same_failure = any(count >= 3 for count in repeated_error_type_counts.values()) or any(
+        count >= 2 for count in repeated_turn_error_counts.values()
+    )
+    likely_not_fixable_by_prompt_only = unfixable_assessment_required and repeated_same_failure
+    if residual_count == 0:
+        status = "resolved"
+    elif likely_not_fixable_by_prompt_only:
+        status = "likely_not_fixable_by_prompt_only"
+    elif unfixable_assessment_required:
+        status = "unfixable_assessment_required"
+    else:
+        status = "prompt_repair_still_plausible"
+    return {
+        "status": status,
+        "prompt_version_count": len(versions),
+        "applied_version_count": applied_version_count,
+        "scanned_version_count": sum(1 for version in versions if version.get("scan_trace_recorded")),
+        "residual_badcase_count": residual_count,
+        "residual_error_types": residual_error_types,
+        "repeated_residual_error_type_counts": repeated_error_type_counts,
+        "repeated_residual_turn_error_counts": repeated_turn_error_counts,
+        "unfixable_assessment_required": unfixable_assessment_required,
+        "likely_not_fixable_by_prompt_only": likely_not_fixable_by_prompt_only,
+        "recommended_next_action": (
+            "Stop repeating prompt-only patches for this residual case. Assess whether required ground truth, "
+            "tool behavior, deterministic replacement, or model/backend escalation is needed."
+            if likely_not_fixable_by_prompt_only
+            else "Continue only with a materially different repair plan tied to the residual evidence."
+        ),
+    }
+
+
 def _line_counts(text: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     for line in text.splitlines():
@@ -3067,6 +3187,7 @@ def _conclusion_root_cause_hints(
     token_probability: object,
     post_rerun_bad_cases: list[BadCase],
     post_rerun_scan_status: str,
+    repair_saturation: dict[str, object] | None = None,
 ) -> list[str]:
     hints: list[str] = []
     if prompt_change_quality.get("has_repeated_added_instruction"):
@@ -3078,6 +3199,14 @@ def _conclusion_root_cause_hints(
     if post_rerun_scan_status == "completed" and post_rerun_bad_cases:
         turns = ", ".join(str(case.turn_index) for case in post_rerun_bad_cases[:6])
         hints.append(f"Post-rerun scan still found residual badcase turns: {turns}.")
+    if repair_saturation and repair_saturation.get("likely_not_fixable_by_prompt_only"):
+        hints.append(
+            "The same residual failure persisted across multiple prompt versions; assess whether prompt-only repair is saturated and whether the case should be handled as unsupported, deterministic replacement, workflow/tool correction, or model/backend escalation."
+        )
+    elif repair_saturation and repair_saturation.get("unfixable_assessment_required"):
+        hints.append(
+            "Multiple prompt versions have already been tried with residual failures; explicitly assess whether another prompt-only edit has new evidence or should stop."
+        )
     return hints
 
 
@@ -3257,6 +3386,7 @@ def _experiment_diagnostic_evidence(
     kwargs = source_meta.get("kwargs") if isinstance(source_meta.get("kwargs"), dict) else {}
     rerun_items = [_rerun_evidence_item(result) for result in rerun_results]
     token_probability = _token_probability_diagnostics(rerun_results)
+    response_metadata = _response_metadata_diagnostics(rerun_results)
     old_text = "\n".join(str(item.get("old_assistant_response") or "") for item in rerun_items)
     new_text = "\n".join(str(item.get("new_assistant_response") or "") for item in rerun_items)
     return {
@@ -3270,6 +3400,7 @@ def _experiment_diagnostic_evidence(
             "new_response_contains_function_call": "<function-call" in new_text,
         },
         "token_probability": token_probability,
+        "response_metadata": response_metadata,
         "metadata": {
             "source_meta_available": bool(source_meta),
             "source_meta_keys": sorted(str(key) for key in source_meta.keys()),
@@ -3355,6 +3486,30 @@ def _token_probability_diagnostics(rerun_results: list[RerunTurn]) -> dict[str, 
             "No token logprob diagnostics were attached to rerun results. "
             "Do not attribute improvement or failure to token error probability."
         ),
+    }
+
+
+def _response_metadata_diagnostics(rerun_results: list[RerunTurn]) -> dict[str, object]:
+    metadata_items = []
+    for result in rerun_results:
+        diagnostics = getattr(result, "response_diagnostics", None) or {}
+        if not isinstance(diagnostics, dict):
+            continue
+        item = {
+            "request_id": diagnostics.get("request_id"),
+            "purpose": diagnostics.get("purpose"),
+            "provider": diagnostics.get("provider"),
+            "model": diagnostics.get("model"),
+            "endpoint": diagnostics.get("endpoint"),
+        }
+        response_meta = diagnostics.get("response_meta")
+        if isinstance(response_meta, dict):
+            item["response_meta"] = response_meta
+        metadata_items.append(item)
+    return {
+        "available": bool(metadata_items),
+        "request_count": len(metadata_items),
+        "items": metadata_items[:12],
     }
 
 
@@ -4306,7 +4461,7 @@ def _company_chat_text(
     expected_prompt_version: str | None = None,
 ) -> str:
     return generate_with_company_demo(
-        messages=messages,
+        messages=_openai_compatible_messages(messages),
         model=settings.model,
         provider=settings.provider,
         url=settings.base_url,
@@ -4333,7 +4488,7 @@ def _preflight_company_rerun_request(
     if settings.backend != "company_api":
         return
     preflight_company_request(
-        messages=messages,
+        messages=_openai_compatible_messages(messages),
         model=settings.model,
         provider=settings.provider,
         url=settings.base_url,

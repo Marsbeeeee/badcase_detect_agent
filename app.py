@@ -43,8 +43,8 @@ load_dotenv()
 
 DEFAULT_COMPANY_URL = os.getenv("COMPANY_LLM_URL", "http://192.168.101.15:9898")
 DEFAULT_COMPANY_PROVIDER = os.getenv("COMPANY_LLM_PROVIDER", "openai_api_like")
-DEFAULT_COMPANY_MODEL = os.getenv("COMPANY_LLM_MODEL", "voyager-1.6-preview-run27m4a8b4-r3")
-APP_BUILD = "round-history-v89"
+DEFAULT_COMPANY_MODEL = os.getenv("COMPANY_LLM_MODEL", "voyager-1.6-gemma4-26b-a4b-it")
+APP_BUILD = "company-model-v90"
 ROUND_HISTORY_LOG = Path(__file__).parent / "logs" / "optimization_rounds.jsonl"
 
 st.set_page_config(
@@ -882,6 +882,7 @@ def rerun_with_prompt(
             applied_feedback_summary=applied_feedback_summary,
             llm_settings=llm_settings,
             post_rerun_scan_status="not_run",
+            prompt_version_history=st.session_state.get("prompt_versions") or [],
         )
         if st.session_state.rerun_conclusion.startswith(
             ("Conclusion could not", "Conclusion was skipped", "Conclusion generation failed")
@@ -934,6 +935,7 @@ def rerun_with_prompt(
         applied_feedback_summary=applied_feedback_summary,
         llm_settings=llm_settings,
         post_rerun_scan_status="completed",
+        prompt_version_history=st.session_state.get("prompt_versions") or [],
     )
 
 
@@ -1419,6 +1421,7 @@ def generate_post_scan_conclusion_if_needed(
         applied_feedback_summary=applied_feedback_summary,
         llm_settings=llm_settings,
         post_rerun_scan_status="completed",
+        prompt_version_history=st.session_state.get("prompt_versions") or [],
     )
     st.session_state.rerun_conclusion = conclusion
     if conclusion.startswith(("Conclusion could not", "Conclusion was skipped", "Conclusion generation failed")):
@@ -2537,7 +2540,6 @@ def main() -> None:
             st.session_state.current_system_prompt_view,
             trace_version=trace_version,
         )
-        render_round_history()
 
     with right_col:
         conversation_view = "Original"

@@ -434,7 +434,7 @@ def _build_request_audit_entry(
 def _should_request_logprobs(purpose: str) -> bool:
     if os.getenv("COMPANY_LLM_REQUEST_LOGPROBS", "1") == "0":
         return False
-    return purpose in {"targeted_rerun", "full_rerun"}
+    return True
 
 
 def _logprob_request_options() -> dict[str, Any]:
@@ -476,11 +476,12 @@ def _response_logprob_diagnostics(
 ) -> dict[str, Any]:
     logprobs = _extract_choice_logprobs(data)
     diagnostics: dict[str, Any] = {
+        "response_meta": _response_meta(data),
         "logprobs": {
             "requested": requested,
             "top_logprobs_requested": top_logprobs_requested,
             "retry_without_logprobs": retry_without_logprobs,
-            "available": bool(logprobs),
+            "available": False,
         }
     }
     if unsupported_error:
@@ -488,6 +489,8 @@ def _response_logprob_diagnostics(
     if not logprobs:
         if requested and retry_without_logprobs:
             diagnostics["logprobs"]["reason"] = "Company API rejected logprobs/top_logprobs and the request was retried without them."
+        elif requested and _has_empty_logprobs(data):
+            diagnostics["logprobs"]["reason"] = "Company API returned an empty logprobs list."
         elif requested:
             diagnostics["logprobs"]["reason"] = "Company API response did not include choices[0].logprobs."
         else:
@@ -499,14 +502,27 @@ def _response_logprob_diagnostics(
         diagnostics["logprobs"]["available"] = False
         diagnostics["logprobs"]["reason"] = "choices[0].logprobs did not include a content token list."
         return diagnostics
+    if not content_logprobs:
+        diagnostics["logprobs"]["available"] = False
+        diagnostics["logprobs"]["content_token_count"] = 0
+        diagnostics["logprobs"]["scored_token_count"] = 0
+        diagnostics["logprobs"]["reason"] = "Company API returned an empty logprobs content list."
+        return diagnostics
     token_rows = [
         row
         for row in content_logprobs
         if isinstance(row, dict) and isinstance(row.get("logprob"), (int, float))
     ]
+    if not token_rows:
+        diagnostics["logprobs"]["available"] = False
+        diagnostics["logprobs"]["content_token_count"] = len(content_logprobs)
+        diagnostics["logprobs"]["scored_token_count"] = 0
+        diagnostics["logprobs"]["reason"] = "Company API logprobs did not include numeric token logprobs."
+        return diagnostics
     logprob_values = [float(row["logprob"]) for row in token_rows]
     diagnostics["logprobs"].update(
         {
+            "available": True,
             "content_token_count": len(content_logprobs),
             "scored_token_count": len(logprob_values),
             "avg_logprob": sum(logprob_values) / len(logprob_values) if logprob_values else None,
@@ -521,16 +537,44 @@ def _response_logprob_diagnostics(
 def _extract_choice_logprobs(data: Any) -> Any:
     if not isinstance(data, dict):
         return None
-    direct_logprobs = data.get("logprobs")
-    if direct_logprobs:
-        return direct_logprobs
+    if "logprobs" in data:
+        return data.get("logprobs")
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         return None
     first = choices[0]
     if not isinstance(first, dict):
         return None
-    return first.get("logprobs")
+    if "logprobs" in first:
+        return first.get("logprobs")
+    return None
+
+
+def _has_empty_logprobs(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if data.get("logprobs") == []:
+        return True
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    first = choices[0]
+    return isinstance(first, dict) and first.get("logprobs") == []
+
+
+def _response_meta(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"response_type": type(data).__name__}
+    meta: dict[str, Any] = {
+        "response_keys": sorted(str(key) for key in data.keys()),
+        "has_usage": isinstance(data.get("usage"), dict),
+        "has_meta": isinstance(data.get("meta"), dict),
+    }
+    if isinstance(data.get("usage"), dict):
+        meta["usage"] = data["usage"]
+    if isinstance(data.get("meta"), dict):
+        meta["meta"] = data["meta"]
+    return meta
 
 
 def _logprob_content_rows(logprobs: Any) -> list[Any] | None:

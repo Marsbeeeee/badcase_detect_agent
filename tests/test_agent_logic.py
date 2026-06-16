@@ -144,39 +144,13 @@ def test_tool_wrapper_bad_case_remaps_to_natural_assistant_reply() -> None:
     assert _normalize_ai_bad_case_turn_index(data, item) == 17
 
 
-def test_local_scan_flags_open_ended_payment_terms_after_rejected_today_offer() -> None:
+def test_local_scan_does_not_emit_prompt_specific_payment_detectors() -> None:
     data = _ptp_attempt_limit_conversation()
 
     cases = _local_prompt_rule_bad_cases(data)
 
-    case = next(
-        item
-        for item in cases
-        if item.error_type == "open_ended_payment_terms_after_rejection"
-    )
-    assert case.turn_index == 7
-    assert "Turn 6 rejected the full-payment-today proposal from turn 5" in case.evidence
-    assert "Assistant turn 7 then asked the user for payment timing" in case.evidence
-    assert "repeats at assistant turns 7, 9" in case.evidence
-    assert "concrete fallback" in case.evidence
-    assert len(case.evidence) < 700
-
-
-def test_local_scan_flags_ptp_attempt_limit_with_counted_evidence() -> None:
-    data = _ptp_attempt_limit_conversation()
-
-    cases = _local_prompt_rule_bad_cases(data)
-
-    case = next(
-        item
-        for item in cases
-        if item.error_type == "ptp_attempt_limit_exceeded"
-    )
-    assert case.turn_index == 9
-    assert "failed proposal-collection count reached 3" in case.evidence
-    assert "user turns 4, 6, 8" in case.evidence
-    assert "State 4.0 (RTP_Closing)" in case.evidence
-    assert len(case.evidence) < 650
+    assert "open_ended_payment_terms_after_rejection" not in {case.error_type for case in cases}
+    assert "ptp_attempt_limit_exceeded" not in {case.error_type for case in cases}
 
 
 def test_local_scan_accepts_final_rtp_closing_after_late_payment_date() -> None:
@@ -209,48 +183,99 @@ def test_local_scan_accepts_final_rtp_closing_after_late_payment_date() -> None:
     ] == []
 
 
-def test_local_scan_flags_missing_fresh_promotion_search() -> None:
+def test_local_scan_flags_generic_missing_required_tool_call() -> None:
     data = ConversationData(
         system_prompt=(
             "Customer Name Gate: You must know the customer's name before processing any request. "
             "If they stated a request earlier, immediately call the required tool for that request "
             "once they provide their name.\n"
-            "Inquiry Handling: Promotions or discounts -> MandiriCX_Call_Center_search_promotion. "
+            "Inquiry Handling: Warranty or refund inquiries -> lookup_warranty_policy. "
             "Every message requires a fresh search, even if you already know the answer from earlier results."
         ),
+        tools={
+            "lookup_warranty_policy": {
+                "type": "function",
+                "function": {"name": "lookup_warranty_policy"},
+            }
+        },
         interactions=[
-            Interaction(role="user", content="promo personal loan dua miliar itu apa"),
+            Interaction(role="user", content="warranty refund policy for laptop"),
             Interaction(role="assistant", content="<function-call>language_detection:{\"language\":\"Bahasa\"}</function-call>"),
             Interaction(role="tool", content="{'status': 'ok'}"),
             Interaction(role="assistant", content="Boleh saya tahu dengan siapa saya berbicara?"),
             Interaction(role="user", content="dengan ibu almah"),
             Interaction(role="assistant", content="Mohon tunggu, saya carikan informasinya."),
-            Interaction(role="assistant", content="Limit pinjaman tersedia hingga tiga ratus lima puluh juta rupiah."),
-            Interaction(role="user", content="bukannya dua miliar ya"),
-            Interaction(role="assistant", content="Untuk nasabah prioritas, limitnya tujuh ratus lima puluh juta rupiah."),
-            Interaction(role="user", content="promosi nikmati kemudahan personal loan dua miliar"),
+            Interaction(role="assistant", content="Warranty refunds are available for eligible laptop purchases."),
+            Interaction(role="user", content="what about exchange"),
+            Interaction(role="assistant", content="Exchange eligibility also follows the warranty policy."),
+            Interaction(role="user", content="warranty refund for headphones"),
             Interaction(
                 role="assistant",
                 content=(
-                    "<function-call>MandiriCX_Call_Center_search_promotion:"
-                    "{\"query\":\"promo personal loan dua miliar\"}</function-call>"
+                    "<function-call>lookup_warranty_policy:"
+                    "{\"query\":\"warranty refund for headphones\"}</function-call>"
                 ),
             ),
-            Interaction(role="tool", content="{\"promotions\":\"Personal loan hingga Rp2 Miliar.\"}"),
-            Interaction(role="assistant", content="Program ini menawarkan personal loan hingga dua miliar rupiah."),
+            Interaction(role="tool", content="{\"policy\":\"Headphones have a 30-day warranty.\"}"),
+            Interaction(role="assistant", content="Headphones have a 30-day warranty policy."),
         ],
     )
 
     cases = [
         case
         for case in _local_prompt_rule_bad_cases(data)
-        if case.error_type == "missing_fresh_promotion_search"
+        if case.error_type == "missing_required_tool_call"
     ]
 
     assert [case.turn_index for case in cases] == [6, 8]
-    assert "User turn 0 asked or followed up on a promotion after the name gate closed at user turn 4" in cases[0].evidence
-    assert "No search_promotion tool call appeared before assistant turn 6" in cases[0].evidence
-    assert "User turn 7 asked or followed up on a promotion" in cases[1].evidence
+    assert "after the name gate closed at user turn 4" in cases[0].evidence
+    assert "No `lookup_warranty_policy` tool call appeared before assistant turn 6" in cases[0].evidence
+    assert "User turn 7 matched the required-tool domain" in cases[1].evidence
+
+
+def test_local_scan_accepts_required_tool_call_before_domain_answer() -> None:
+    data = ConversationData(
+        system_prompt=(
+            "For warranty inquiries, every customer message requires lookup_warranty_policy "
+            "before answering warranty facts."
+        ),
+        tools={
+            "lookup_warranty_policy": {
+                "type": "function",
+                "function": {"name": "lookup_warranty_policy"},
+            }
+        },
+        interactions=[
+            Interaction(role="user", content="warranty on a laptop"),
+            Interaction(role="assistant", content="<function-call>lookup_warranty_policy:{\"query\":\"laptop\"}</function-call>"),
+            Interaction(role="tool", content="{\"policy\":\"one year\"}"),
+            Interaction(role="assistant", content="The laptop warranty is one year."),
+        ],
+    )
+
+    cases = _local_prompt_rule_bad_cases(data)
+
+    assert "missing_required_tool_call" not in {case.error_type for case in cases}
+
+
+def test_local_scan_ignores_adjacent_domain_without_required_tool_rule() -> None:
+    data = ConversationData(
+        system_prompt="For warranty inquiries, answer using known policy text.",
+        tools={
+            "lookup_warranty_policy": {
+                "type": "function",
+                "function": {"name": "lookup_warranty_policy"},
+            }
+        },
+        interactions=[
+            Interaction(role="user", content="warranty on a laptop"),
+            Interaction(role="assistant", content="The laptop warranty is one year."),
+        ],
+    )
+
+    cases = _local_prompt_rule_bad_cases(data)
+
+    assert "missing_required_tool_call" not in {case.error_type for case in cases}
 
 
 def test_analyze_bad_cases_dedupes_ai_and_local_same_turn_tool_failure() -> None:
@@ -265,12 +290,12 @@ def test_analyze_bad_cases_dedupes_ai_and_local_same_turn_tool_failure() -> None
                         "role": "assistant",
                         "error_type": "missing_tool_call",
                         "evidence": (
-                            "The assistant answered a promotion question without a fresh "
-                            "search_promotion tool call. This duplicates the local scan."
+                            "The assistant answered a warranty question without the required "
+                            "lookup_warranty_policy tool call. This duplicates the local scan."
                         ),
-                        "recommendation": "Call search_promotion before answering.",
-                        "turn_content_excerpt": "Program ini untuk nasabah prioritas.",
-                        "violated_prompt_excerpt": "Every promotion message requires fresh search.",
+                        "recommendation": "Call lookup_warranty_policy before answering.",
+                        "turn_content_excerpt": "The laptop warranty is one year.",
+                        "violated_prompt_excerpt": "Every warranty message requires lookup_warranty_policy.",
                         "severity": "high",
                         "confidence": 0.95,
                         "hard_violation": True,
@@ -283,14 +308,20 @@ def test_analyze_bad_cases_dedupes_ai_and_local_same_turn_tool_failure() -> None
     try:
         data = ConversationData(
             system_prompt=(
-                "For promotion inquiries, every customer message requires a fresh search. "
-                "You must call search_promotion before answering any promotion, discount, or banking-service facts."
+                "For warranty inquiries, every customer message requires lookup_warranty_policy "
+                "before answering any warranty facts."
             ),
+            tools={
+                "lookup_warranty_policy": {
+                    "type": "function",
+                    "function": {"name": "lookup_warranty_policy"},
+                }
+            },
             interactions=[
-                Interaction(role="user", content="Ada promo personal loan?"),
+                Interaction(role="user", content="What is the laptop warranty?"),
                 Interaction(
                     role="assistant",
-                    content="Program personal loan ini untuk nasabah prioritas dengan dana minimum satu miliar.",
+                    content="The laptop warranty is one year.",
                 ),
             ],
         )
@@ -308,7 +339,7 @@ def test_analyze_bad_cases_dedupes_ai_and_local_same_turn_tool_failure() -> None
 
     assert len(cases) == 1
     assert cases[0].turn_index == 1
-    assert cases[0].error_type == "missing_fresh_promotion_search"
+    assert cases[0].error_type == "missing_required_tool_call"
     assert cases[0].source == "local_scan"
 
 

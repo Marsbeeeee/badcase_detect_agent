@@ -21,6 +21,13 @@ outputs/
 dist/
 build/
 
+# Local scratch artifacts
+.tmp*/
+.tmp_*/
+.tmp_*
+*.tmp
+llmparty/llmparty/
+
 # Editor and OS files
 .DS_Store
 .vscode/

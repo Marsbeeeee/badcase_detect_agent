@@ -330,26 +330,13 @@ def analyze_bad_cases(
 
 
 def _local_prompt_rule_bad_cases(data: ConversationData) -> list[BadCase]:
-    """Deterministic checks for explicit hard rules that LLM judges often under-count."""
+    """Reusable deterministic checks for explicit hard rules that LLM judges often under-count."""
     cases: list[BadCase] = []
     if data.tools is not None:
         cases.extend(_local_undefined_tool_call_cases(data))
     if _prompt_defines_escalation_protocol(data.system_prompt):
         cases.extend(_local_escalation_protocol_cases(data))
-    if _prompt_requires_busy_brief_moment(data.system_prompt):
-        cases.extend(_local_busy_availability_cases(data))
-    if _prompt_requires_current_year_omission(data.system_prompt):
-        cases.extend(_local_current_year_omission_cases(data))
-    if _prompt_requires_silence_final_stop(data.system_prompt):
-        cases.extend(_local_silence_final_stop_cases(data))
-    if _prompt_requires_late_date_rtp_closing(data.system_prompt):
-        cases.extend(_local_late_payment_proposal_cases(data))
-    if _prompt_requires_concrete_payment_fallback(data.system_prompt):
-        cases.extend(_local_open_ended_payment_fallback_cases(data))
-    if _prompt_requires_ptp_attempt_limit_closing(data.system_prompt):
-        cases.extend(_local_ptp_attempt_limit_cases(data))
-    if _prompt_requires_fresh_search_for_inquiries(data.system_prompt):
-        cases.extend(_local_missing_fresh_search_cases(data))
+    cases.extend(_local_missing_required_tool_call_cases(data))
     return _dedupe_bad_cases(cases)
 
 
@@ -672,230 +659,6 @@ def _escalation_rule_excerpt(system_prompt: str) -> str:
     return "When an escalation trigger occurs, immediately stop the core flow and execute the configured escalation action."
 
 
-def _prompt_requires_busy_brief_moment(system_prompt: str) -> bool:
-    lowered = system_prompt.lower()
-    return "busy" in lowered and "brief moment" in lowered
-
-
-def _local_busy_availability_cases(data: ConversationData) -> list[BadCase]:
-    cases: list[BadCase] = []
-    pending_busy_user_index: int | None = None
-    for index, turn in enumerate(data.interactions):
-        role = turn.role.lower()
-        if role == "user":
-            if _user_says_busy_or_unavailable(turn.content):
-                pending_busy_user_index = index
-            continue
-        if role != "assistant" or pending_busy_user_index is None:
-            continue
-        user_index = pending_busy_user_index
-        pending_busy_user_index = None
-        if _assistant_checks_brief_moment(turn.content):
-            continue
-        cases.append(
-            BadCase(
-                turn_index=index,
-                role="assistant",
-                error_type="busy_availability_check_skipped",
-                evidence=(
-                    "Violated rule: When the user says they are busy or unavailable, the assistant must "
-                    "acknowledge that and check whether they have a brief moment before continuing.\n\n"
-                    "Evidence: "
-                    f"User turn {user_index} said they were busy/unavailable "
-                    f"({_quote_turn(data.interactions[user_index].content)}). Assistant turn {index} continued "
-                    f"without a brief-moment availability check ({_quote_turn(turn.content)})."
-                ),
-                recommendation=(
-                    "Revise the busy/not-available branch so it first checks whether the user has a brief "
-                    "moment, then follows the prompt's configured payment or callback sequence."
-                ),
-                source="local_scan",
-            )
-        )
-    return cases
-
-
-def _user_says_busy_or_unavailable(text: str) -> bool:
-    lowered = _compact_text(text).lower()
-    return any(
-        re.search(pattern, lowered)
-        for pattern in (
-            r"\bbusy\b",
-            r"\bin a meeting\b",
-            r"\bdriving\b",
-            r"\bnot available\b",
-            r"\bcan'?t talk\b",
-            r"\bsibuk\b",
-            r"\blagi narik\b",
-            r"\btidak bisa bicara\b",
-            r"\btak boleh bercakap\b",
-            r"(?:很忙|没空|不方便|不能说话|在开会|在忙)",
-        )
-    )
-
-
-def _assistant_checks_brief_moment(text: str) -> bool:
-    lowered = _compact_text(text).lower()
-    return any(
-        term in lowered
-        for term in (
-            "brief moment",
-            "a moment",
-            "sedikit waktu",
-            "sebentar",
-            "sejenak",
-            "masa sebentar",
-            "一点时间",
-            "一会儿",
-            "方便",
-        )
-    )
-
-
-def _prompt_requires_current_year_omission(system_prompt: str) -> bool:
-    lowered = system_prompt.lower()
-    return "must omit the year" in lowered or "year 2026 must be omitted" in lowered
-
-
-def _local_current_year_omission_cases(data: ConversationData) -> list[BadCase]:
-    current_year = _current_year_from_prompt(data.system_prompt)
-    if current_year is None:
-        return []
-    for index, turn in enumerate(data.interactions):
-        if turn.role.lower() != "assistant":
-            continue
-        if _looks_like_tool_wrapper(turn.content):
-            continue
-        if not _looks_like_payment_confirmation(turn.content):
-            continue
-        if not _contains_current_year_reference(turn.content, current_year):
-            continue
-        return [
-            BadCase(
-                turn_index=index,
-                role="assistant",
-                error_type="current_year_not_omitted_in_date",
-                evidence=(
-                    "Violated rule: Date verbalization for dates in the current year must omit the year.\n\n"
-                    "Evidence: "
-                    f"The prompt requires omitting {current_year} for current-year payment dates, but assistant "
-                    f"turn {index} included the year in the payment confirmation "
-                    f"({_quote_turn(turn.content)})."
-                ),
-                recommendation=(
-                    "Revise the date-verbalization and PTP closing instructions so current-year dates are "
-                    "rendered without the year in the active language."
-                ),
-                source="local_scan",
-            )
-        ]
-    return []
-
-
-def _current_year_from_prompt(system_prompt: str) -> int | None:
-    patterns = (
-        r"current year\s*\(?(\d{4})\)?",
-        r"today'?s reference date is [^`\n]*?(\d{4})",
-        r"today'?s date is\s*`?[^`\n]*?(\d{4})",
-        r"reference date[:：]\s*`?[^`\n]*?(\d{4})",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, system_prompt, flags=re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-    return None
-
-
-def _looks_like_payment_confirmation(text: str) -> bool:
-    lowered = _compact_text(text).lower()
-    return any(
-        term in lowered
-        for term in (
-            "commitment",
-            "confirm",
-            "payment",
-            "pay",
-            "bayaran",
-            "pembayaran",
-            "komitmen",
-            "membuat bayaran",
-            "还款",
-            "付款",
-            "承诺",
-            "确认",
-        )
-    )
-
-
-def _contains_current_year_reference(text: str, year: int) -> bool:
-    lowered = _compact_text(text).lower()
-    if str(year) in lowered:
-        return True
-    if year == 2026:
-        return any(
-            term in lowered
-            for term in (
-                "twenty twenty-six",
-                "twenty twenty six",
-                "dua ribu dua puluh enam",
-                "二零二六",
-                "二〇二六",
-                "两千零二十六",
-            )
-        )
-    return False
-
-
-def _prompt_requires_silence_final_stop(system_prompt: str) -> bool:
-    lowered = system_prompt.lower()
-    return "silence" in lowered and ("third consecutive" in lowered or "3rd silence" in lowered)
-
-
-def _local_silence_final_stop_cases(data: ConversationData) -> list[BadCase]:
-    consecutive_silences = 0
-    for index, turn in enumerate(data.interactions):
-        role = turn.role.lower()
-        if role == "user":
-            if _is_silence_turn(turn.content):
-                consecutive_silences += 1
-            else:
-                consecutive_silences = 0
-            continue
-        if role != "assistant":
-            continue
-        if consecutive_silences < 3:
-            continue
-        if "<dialog-end>" in turn.content.lower() and not _assistant_asks_question(turn.content):
-            consecutive_silences = 0
-            continue
-        return [
-            BadCase(
-                turn_index=index,
-                role="assistant",
-                error_type="third_silence_stop_not_followed",
-                evidence=(
-                    "Violated rule: On the third consecutive silence, the assistant must stop asking questions "
-                    "and immediately produce the configured call-termination script.\n\n"
-                    "Evidence: "
-                    f"Before assistant turn {index}, the user had reached {consecutive_silences} consecutive "
-                    f"silence turns. Assistant turn {index} did not stop with a terminal script "
-                    f"({_quote_turn(turn.content)})."
-                ),
-                recommendation=(
-                    "Revise silence handling so the third consecutive `<silence>` routes directly to the "
-                    "terminal closing script with `<dialog-end>` and no further questions."
-                ),
-                source="local_scan",
-            )
-        ]
-    return []
-
-
-def _is_silence_turn(text: str) -> bool:
-    normalized = _compact_text(text).strip().lower()
-    return normalized in {"<silence>", "", "silence"}
-
-
 def _assistant_asks_question(text: str) -> bool:
     lowered = _compact_text(text).lower()
     return "?" in lowered or any(
@@ -915,253 +678,15 @@ def _assistant_asks_question(text: str) -> bool:
     )
 
 
-def _prompt_requires_late_date_rtp_closing(system_prompt: str) -> bool:
-    lowered = system_prompt.lower()
-    return (
-        "rtp_closing" in lowered
-        and (
-            "later than" in lowered
-            or "greater than" in lowered
-            or ">" in lowered
-            or "maximum payment date" in lowered
-        )
-        and ("not negotiate" in lowered or "immediately proceed" in lowered or "immediately proceed to" in lowered)
-    )
-
-
-def _local_late_payment_proposal_cases(data: ConversationData) -> list[BadCase]:
-    cases: list[BadCase] = []
-    pending_late_user_index: int | None = None
-    for index, turn in enumerate(data.interactions):
-        role = turn.role.lower()
-        if role == "user":
-            if _user_proposes_late_payment_date(turn.content):
-                pending_late_user_index = index
-            continue
-        if role != "assistant" or pending_late_user_index is None:
-            continue
-        user_index = pending_late_user_index
-        pending_late_user_index = None
-        if _assistant_moves_to_rtp_closing(turn.content, data.system_prompt):
-            continue
-        cases.append(
-            BadCase(
-                turn_index=index,
-                role="assistant",
-                error_type="late_payment_proposal_not_rtp_closing",
-                evidence=(
-                    "Violated rule: When the user proposes a payment date later than the maximum allowed "
-                    "date, the assistant must immediately proceed to RTP_Closing and must not negotiate "
-                    "or attempt to adjust the date.\n\n"
-                    "Evidence: "
-                    f"User turn {user_index} proposed a late payment timing "
-                    f"({_quote_turn(data.interactions[user_index].content)}). Assistant turn {index} continued "
-                    f"negotiating or asking a follow-up instead of moving directly to RTP_Closing "
-                    f"({_quote_turn(turn.content)})."
-                ),
-                recommendation=(
-                    "Revise the late-date validation branch so any proposal beyond the maximum date routes "
-                    "directly to RTP_Closing, with no follow-up question or attempt to pull the date earlier."
-                ),
-                source="local_scan",
-            )
-        )
-    return cases
-
-
-def _user_proposes_late_payment_date(text: str) -> bool:
-    lowered = _compact_text(text).lower()
-    return any(
-        term in lowered
-        for term in (
-            "next month",
-            "bulan depan",
-            "month depan",
-            "minggu depan",
-            "next week",
-            "下个月",
-            "下個月",
-            "下周",
-            "下星期",
-        )
-    )
-
-
-def _assistant_moves_to_rtp_closing(text: str, system_prompt: str = "") -> bool:
-    lowered = _compact_text(text).lower()
-    if _assistant_asks_question(text):
-        return False
-    if _looks_like_final_rtp_closing(text, system_prompt):
-        return True
-    if _asks_open_ended_payment_terms(text):
-        return False
-    return any(
-        term in lowered
-        for term in (
-            "rtp_closing",
-            "follow-up calls",
-            "follow up calls",
-            "panggilan lanjutan",
-            "panggilan susulan",
-            "legal",
-            "biaya tambahan",
-            "denda tambahan",
-            "maintain a positive payment history",
-            "status akun",
-            "保持良好",
-            "后续致电",
-        )
-    )
-
-
-def _looks_like_final_rtp_closing(text: str, system_prompt: str = "") -> bool:
-    lowered = _compact_text(text).lower()
-    if "<dialog-end>" not in lowered:
-        return False
-    has_deadline = _contains_date_or_deadline_reference(lowered, system_prompt)
-    has_payment_requirement = any(
-        term in lowered
-        for term in (
-            "payment",
-            "pay",
-            "repay",
-            "pembayaran",
-            "bayar",
-            "melunasi",
-            "tunggakan",
-            "rupiah",
-            "还款",
-            "付款",
-        )
-    )
-    has_consequence = any(
-        term in lowered
-        for term in (
-            "additional fee",
-            "late fee",
-            "payment history",
-            "account status",
-            "follow-up",
-            "collection",
-            "legal",
-            "denda tambahan",
-            "biaya tambahan",
-            "riwayat kredit",
-            "status akun",
-            "penagihan lebih lanjut",
-            "follow-up calls",
-            "panggilan lanjutan",
-        )
-    )
-    return has_deadline and has_payment_requirement and has_consequence
-
-
-def _contains_date_or_deadline_reference(response_lowered: str, system_prompt: str = "") -> bool:
-    if any(marker in response_lowered for marker in ("deadline", "paling lambat", "latest date", "due date")):
-        return True
-    if _contains_calendar_date(response_lowered):
-        return True
-    for marker in _prompt_date_markers(system_prompt):
-        if marker and marker in response_lowered:
-            return True
-    return False
-
-
-def _contains_calendar_date(text_lowered: str) -> bool:
-    month_names = (
-        "jan",
-        "january",
-        "januari",
-        "feb",
-        "february",
-        "februari",
-        "mar",
-        "march",
-        "maret",
-        "apr",
-        "april",
-        "may",
-        "mei",
-        "jun",
-        "june",
-        "juni",
-        "jul",
-        "july",
-        "juli",
-        "aug",
-        "august",
-        "agustus",
-        "sep",
-        "september",
-        "oct",
-        "october",
-        "oktober",
-        "nov",
-        "november",
-        "dec",
-        "december",
-        "desember",
-    )
-    month_pattern = "|".join(re.escape(month) for month in month_names)
-    return bool(
-        re.search(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", text_lowered)
-        or re.search(rf"\b\d{{1,2}}\s+(?:{month_pattern})\w*\s+20\d{{2}}\b", text_lowered)
-        or re.search(rf"\b(?:{month_pattern})\w*\s+\d{{1,2}},?\s+20\d{{2}}\b", text_lowered)
-    )
-
-
-def _prompt_date_markers(system_prompt: str) -> set[str]:
-    markers: set[str] = set()
-    lowered = system_prompt.lower()
-    markers.update(re.findall(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", lowered))
-    for match in re.finditer(
-        r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s+"
-        r"([a-z]+\s+\d{1,2},?\s+20\d{2})\b",
-        lowered,
-    ):
-        markers.add(re.sub(r"\s+", " ", match.group(1)).strip())
-    return markers
-
-
-def _prompt_requires_concrete_payment_fallback(system_prompt: str) -> bool:
-    lowered = system_prompt.lower()
-    return (
-        "never ask" in lowered
-        and ("amount or date" in lowered or "when can you pay" in lowered or "how much can you pay" in lowered)
-        and ("concrete" in lowered or "pre-defined" in lowered or "predefined" in lowered)
-        and ("payment" in lowered or "pay" in lowered)
-    )
-
-
-def _prompt_requires_ptp_attempt_limit_closing(system_prompt: str) -> bool:
-    lowered = system_prompt.lower()
-    has_attempt_limit = (
-        "maximum of three attempts" in lowered
-        or "3-attempt" in lowered
-        or "three attempts" in lowered
-    )
-    return has_attempt_limit and "state 4.0" in lowered and "rtp_closing" in lowered
-
-
-def _prompt_requires_fresh_search_for_inquiries(system_prompt: str) -> bool:
-    lowered = system_prompt.lower()
-    return (
-        "fresh search" in lowered
-        and (
-            "every customer message" in lowered
-            or "every message requires" in lowered
-            or "call search_promotion" in lowered
-        )
-        and ("promotion" in lowered or "promotions" in lowered or "discount" in lowered)
-    )
-
-
-def _local_missing_fresh_search_cases(data: ConversationData) -> list[BadCase]:
+def _local_missing_required_tool_call_cases(data: ConversationData) -> list[BadCase]:
+    rule = _required_tool_rule_from_prompt(data)
+    if rule is None:
+        return []
     cases: list[BadCase] = []
     pending_user_index: int | None = None
     pending_started_before_name = False
-    search_seen_for_pending = False
-    promotion_context_active = False
+    tool_seen_for_pending = False
+    inquiry_context_active = False
     name_gate_required = "customer name gate" in data.system_prompt.lower()
     name_known = not name_gate_required
     name_gate_closed_index: int | None = None
@@ -1173,19 +698,22 @@ def _local_missing_fresh_search_cases(data: ConversationData) -> list[BadCase]:
             if previous_assistant_asked_name and not _is_conversation_marker(turn.content):
                 name_known = True
                 name_gate_closed_index = index
+                previous_assistant_asked_name = False
+                if pending_user_index is not None:
+                    continue
             previous_assistant_asked_name = False
-            if _is_promotion_user_message(turn.content, promotion_context_active):
+            if _is_required_tool_user_message(turn.content, inquiry_context_active, rule):
                 pending_user_index = index
                 pending_started_before_name = not name_known
-                search_seen_for_pending = False
-                promotion_context_active = True
+                tool_seen_for_pending = False
+                inquiry_context_active = True
             continue
 
         if role == "assistant":
-            if _is_search_promotion_tool_call(turn.content):
+            if _is_required_tool_call(turn.content, rule.tool_name):
                 if pending_user_index is not None:
-                    search_seen_for_pending = True
-                promotion_context_active = True
+                    tool_seen_for_pending = True
+                inquiry_context_active = True
                 previous_assistant_asked_name = False
                 continue
 
@@ -1202,23 +730,24 @@ def _local_missing_fresh_search_cases(data: ConversationData) -> list[BadCase]:
                 continue
             if not name_known:
                 continue
-            if not _assistant_answers_promotion_or_product(turn.content):
+            if not _assistant_answers_required_tool_domain(turn.content, rule):
                 continue
-            if search_seen_for_pending:
+            if tool_seen_for_pending:
                 pending_user_index = None
-                search_seen_for_pending = False
+                tool_seen_for_pending = False
                 continue
             cases.append(
-                _missing_fresh_search_bad_case(
+                _missing_required_tool_call_bad_case(
                     data=data,
+                    rule=rule,
                     assistant_index=index,
                     user_index=pending_user_index,
                     name_gate_closed_index=name_gate_closed_index if pending_started_before_name else None,
                 )
             )
             pending_user_index = None
-            search_seen_for_pending = False
-            promotion_context_active = True
+            tool_seen_for_pending = False
+            inquiry_context_active = True
             continue
 
         if role == "tool":
@@ -1227,8 +756,88 @@ def _local_missing_fresh_search_cases(data: ConversationData) -> list[BadCase]:
     return cases
 
 
-def _missing_fresh_search_bad_case(
+@dataclass(frozen=True)
+class _RequiredToolRule:
+    tool_name: str
+    domain_terms: tuple[str, ...]
+    rule_excerpt: str
+
+
+def _required_tool_rule_from_prompt(data: ConversationData) -> _RequiredToolRule | None:
+    tool_names = _available_tool_names(data)
+    if not tool_names:
+        return None
+    prompt = _compact_text(data.system_prompt)
+    lowered = prompt.lower()
+    if not any(term in lowered for term in ("must call", "requires", "required", "before answering", "fresh")):
+        return None
+    if not any(term in lowered for term in ("every customer message", "every message", "before answering")):
+        return None
+    for tool_name in sorted(tool_names, key=len, reverse=True):
+        if tool_name.lower() not in lowered:
+            continue
+        domain_terms = _domain_terms_near_tool_rule(prompt, tool_name)
+        if not domain_terms:
+            continue
+        return _RequiredToolRule(
+            tool_name=tool_name,
+            domain_terms=domain_terms,
+            rule_excerpt=_required_tool_rule_excerpt(prompt, tool_name),
+        )
+    return None
+
+
+def _domain_terms_near_tool_rule(prompt: str, tool_name: str) -> tuple[str, ...]:
+    lowered = prompt.lower()
+    tool_index = lowered.find(tool_name.lower())
+    window_start = max(0, tool_index - 360) if tool_index >= 0 else 0
+    window_end = min(len(prompt), (tool_index if tool_index >= 0 else 0) + len(tool_name) + 360)
+    window = prompt[window_start:window_end].lower()
+    candidates = set(re.findall(r"\b[a-z][a-z0-9_-]{3,}\b", window))
+    generic = {
+        "must",
+        "call",
+        "tool",
+        "function",
+        "before",
+        "after",
+        "answer",
+        "answering",
+        "every",
+        "message",
+        "customer",
+        "requires",
+        "required",
+        "fresh",
+        "search",
+        "inquiry",
+        "inquiries",
+        "handling",
+        "request",
+        "stated",
+        "earlier",
+        "immediately",
+        "processing",
+        "name",
+        "gate",
+    }
+    terms = {term for term in candidates if term not in generic and term not in tool_name.lower()}
+    tool_tokens = set(re.findall(r"[a-z0-9]+", tool_name.lower()))
+    terms.update(token for token in tool_tokens if token not in generic and len(token) > 3)
+    return tuple(sorted(terms))
+
+
+def _required_tool_rule_excerpt(prompt: str, tool_name: str) -> str:
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", prompt)
+    matching = [sentence.strip() for sentence in sentences if tool_name.lower() in sentence.lower()]
+    if matching:
+        return _quote_turn(" ".join(matching[:2]), max_chars=260)
+    return _quote_turn(prompt, max_chars=260)
+
+
+def _missing_required_tool_call_bad_case(
     data: ConversationData,
+    rule: _RequiredToolRule,
     assistant_index: int,
     user_index: int,
     name_gate_closed_index: int | None,
@@ -1239,35 +848,28 @@ def _missing_fresh_search_bad_case(
         else ""
     )
     evidence = (
-        "Violated rule: Promotion-related customer messages require a fresh search before answering.\n\n"
+        f"Violated rule: {rule.rule_excerpt}\n\n"
         "Evidence: "
-        f"User turn {user_index} asked or followed up on a promotion{name_gate_note}. "
-        f"No search_promotion tool call appeared before assistant turn {assistant_index}, "
-        f"which answered with product/promotion details ({_promotion_answer_excerpt(data.interactions[assistant_index].content)})."
+        f"User turn {user_index} matched the required-tool domain{name_gate_note}. "
+        f"No `{rule.tool_name}` tool call appeared before assistant turn {assistant_index}, "
+        f"which answered with domain-specific details ({_domain_answer_excerpt(data.interactions[assistant_index].content, rule)})."
     )
     return BadCase(
         turn_index=assistant_index,
         role="assistant",
-        error_type="missing_fresh_promotion_search",
+        error_type="missing_required_tool_call",
         evidence=evidence,
         recommendation=(
-            "Revise the inquiry/promotion workflow so every promotion-related customer message triggers "
-            "the required fresh-search tool before any factual product or promotion answer, including "
-            "follow-up confirmations and corrections."
+            "Revise the workflow so every matching customer message triggers the configured required tool "
+            "before any factual domain answer, including follow-up confirmations and corrections."
         ),
         source="local_scan",
     )
 
 
-def _is_search_promotion_tool_call(content: str) -> bool:
-    return bool(
-        re.search(
-            r"<function-call>\s*MandiriCX_Call_Center_search_promotion\s*:",
-            content,
-            flags=re.IGNORECASE,
-        )
-        or re.search(r"<function-call>\s*search_promotion\s*:", content, flags=re.IGNORECASE)
-    )
+def _is_required_tool_call(content: str, tool_name: str) -> bool:
+    pattern = rf"<function-call>\s*{re.escape(tool_name)}\s*:"
+    return bool(re.search(pattern, content, flags=re.IGNORECASE))
 
 
 def _assistant_asks_for_customer_name(text: str) -> bool:
@@ -1283,44 +885,25 @@ def _is_conversation_marker(text: str) -> bool:
     return _compact_text(text).strip().lower() in {"[conversation begins]", "conversation begins"}
 
 
-def _is_promotion_user_message(text: str, promotion_context_active: bool) -> bool:
+def _is_required_tool_user_message(text: str, inquiry_context_active: bool, rule: _RequiredToolRule) -> bool:
     lowered = _compact_text(text).lower()
     if _is_conversation_marker(lowered):
         return False
-    explicit_terms = (
-        "promo",
-        "promosi",
-        "discount",
-        "diskon",
-        "personal loan",
-        "personel",
-        "pinjaman",
-        "kredit serbaguna",
-        "program",
-    )
-    if any(term in lowered for term in explicit_terms):
+    if any(term in lowered for term in rule.domain_terms):
         return True
-    if not promotion_context_active:
+    if not inquiry_context_active:
         return False
-    followup_terms = (
-        "dua miliar",
-        "2 miliar",
-        "rp2 miliar",
-        "satu miliar",
-        "1 miliar",
-        "minimum",
-        "dana",
-        "tenor",
-        "benefit",
-        "syarat",
-        "bener",
-        "benar",
-        "bukannya",
-    )
-    return any(term in lowered for term in followup_terms)
+    return _looks_like_short_followup(lowered)
 
 
-def _assistant_answers_promotion_or_product(text: str) -> bool:
+def _looks_like_short_followup(lowered: str) -> bool:
+    if _assistant_asks_question(lowered):
+        return False
+    words = re.findall(r"\w+", lowered)
+    return 0 < len(words) <= 12
+
+
+def _assistant_answers_required_tool_domain(text: str, rule: _RequiredToolRule) -> bool:
     lowered = _compact_text(text).lower()
     if any(
         phrase in lowered
@@ -1333,305 +916,17 @@ def _assistant_answers_promotion_or_product(text: str) -> bool:
         )
     ):
         return False
-    answer_terms = (
-        "limit",
-        "pinjaman",
-        "kredit",
-        "nasabah",
-        "prioritas",
-        "miliar",
-        "juta",
-        "suku bunga",
-        "tenor",
-        "tanpa agunan",
-        "benefit",
-        "program",
-        "livin",
-    )
-    return any(term in lowered for term in answer_terms)
+    return any(term in lowered for term in rule.domain_terms)
 
 
-def _promotion_answer_excerpt(text: str) -> str:
+def _domain_answer_excerpt(text: str, rule: _RequiredToolRule) -> str:
     compacted = _compact_text(text)
-    patterns = (
-        r"(?:limit|pinjaman|kredit|personal loan)[^.!?]*(?:miliar|juta|rupiah)[^.!?]*[.!?]?",
-        r"(?:program|nasabah|prioritas)[^.!?]*(?:miliar|minimum|dana|bulan)[^.!?]*[.!?]?",
-        r"(?:suku bunga|tenor|tanpa agunan)[^.!?]*[.!?]?",
-    )
-    for pattern in patterns:
+    for term in rule.domain_terms:
+        pattern = rf"[^.!?]*\b{re.escape(term)}\b[^.!?]*[.!?]?"
         match = re.search(pattern, compacted, flags=re.IGNORECASE)
         if match:
             return _quote_turn(match.group(0), max_chars=120)
     return _quote_turn(compacted, max_chars=120)
-
-
-def _local_open_ended_payment_fallback_cases(data: ConversationData) -> list[BadCase]:
-    rejected_offer = _latest_rejected_full_payment_today(data, len(data.interactions))
-    if rejected_offer is None:
-        return []
-    proposal_index, rejection_index = rejected_offer
-    offender_indices = [
-        index
-        for index, turn in enumerate(data.interactions)
-        if (
-            index > rejection_index
-            and turn.role.lower() == "assistant"
-            and _asks_open_ended_payment_terms(turn.content)
-        )
-    ]
-    if not offender_indices:
-        return []
-
-    first_offender = offender_indices[0]
-    repeated_note = ""
-    if len(offender_indices) > 1:
-        repeated_note = f" The same pattern repeats at assistant turns {_format_index_list(offender_indices)}."
-    evidence = (
-        "Violated rule: After a concrete payment proposal is rejected, propose the next pre-defined terms; "
-        "do not ask the user for payment terms.\n\n"
-        "Evidence: "
-        f"Turn {rejection_index} rejected the full-payment-today proposal from turn {proposal_index}. "
-        f"Assistant turn {first_offender} then asked the user for payment timing "
-        f"({_payment_term_question_excerpt(data.interactions[first_offender].content)}) instead of proposing a concrete fallback."
-        f"{repeated_note}"
-    )
-    return [
-        BadCase(
-            turn_index=first_offender,
-            role="assistant",
-            error_type="open_ended_payment_terms_after_rejection",
-            evidence=evidence,
-            recommendation=(
-                "Revise the relevant State 2.2 negotiation branch so that after the full-payment-today "
-                "proposal is rejected, the assistant offers the next concrete pre-defined fallback term "
-                "instead of asking the user when or how much they can pay."
-            ),
-            source="local_scan",
-        )
-    ]
-
-
-def _local_ptp_attempt_limit_cases(data: ConversationData) -> list[BadCase]:
-    for index, turn in enumerate(data.interactions):
-        if turn.role.lower() != "assistant":
-            continue
-        if not _asks_open_ended_payment_terms(turn.content):
-            continue
-        failed_user_indices = _failed_payment_collection_user_indices(data, before_index=index)
-        if len(failed_user_indices) < 3:
-            continue
-        counted_indices = failed_user_indices[:3]
-        evidence = (
-            "Violated rule: After three failed proposal-collection attempts, proceed to State 4.0 "
-            "(RTP_Closing) without prompting again.\n\n"
-            "Evidence: "
-            f"The failed proposal-collection count reached {len(counted_indices)} before assistant turn {index} "
-            f"(user turns {_format_index_list(counted_indices)} all refused payment without giving a valid date). "
-            f"Assistant turn {index} still asked for a payment date "
-            f"({_payment_term_question_excerpt(turn.content)}) instead of moving to RTP_Closing."
-        )
-        return [
-            BadCase(
-                turn_index=index,
-                role="assistant",
-                error_type="ptp_attempt_limit_exceeded",
-                evidence=evidence,
-                recommendation=(
-                    "Revise State 2.2 so the assistant keeps an explicit failed-attempt counter and, "
-                    "once the third failed clarify/collect attempt is reached, immediately transitions "
-                    "to State 4.0 (RTP_Closing) without asking another payment-date or payment-amount question."
-                ),
-                source="local_scan",
-            )
-        ]
-    return []
-
-
-def _latest_rejected_full_payment_today(
-    data: ConversationData,
-    before_index: int,
-) -> tuple[int, int] | None:
-    latest: tuple[int, int] | None = None
-    for index, turn in enumerate(data.interactions[:before_index]):
-        if turn.role.lower() != "user" or not _is_payment_refusal(turn.content):
-            continue
-        proposal_index = _previous_assistant_index(data, index)
-        if proposal_index is None:
-            continue
-        if _proposes_full_payment_today(data.interactions[proposal_index].content):
-            latest = (proposal_index, index)
-    return latest
-
-
-def _previous_assistant_index(data: ConversationData, before_index: int) -> int | None:
-    for index in range(before_index - 1, -1, -1):
-        if data.interactions[index].role.lower() == "assistant":
-            return index
-    return None
-
-
-def _proposes_full_payment_today(text: str) -> bool:
-    lowered = _compact_text(text).lower()
-    return (
-        any(term in lowered for term in ("today", "hari ini", "今天"))
-        and any(
-            term in lowered
-            for term in (
-                "payment",
-                "pay",
-                "settle",
-                "bayar",
-                "pembayaran",
-                "bayaran",
-                "selesaikan",
-                "melakukan pembayaran",
-                "还款",
-                "付款",
-                "支付",
-            )
-        )
-        and (
-            any(term in lowered for term in ("full", "penuh", "lunas", "全部", "全额"))
-            or re.search(r"\b\d+(?:\.\d+)?\b", lowered) is not None
-            or any(term in lowered for term in ("ratus", "ribu", "ringgit", "rupiah", "令吉", "百", "千"))
-        )
-    )
-
-
-def _asks_open_ended_payment_terms(text: str) -> bool:
-    lowered = _compact_text(text).lower()
-    if not any(
-        term in lowered
-        for term in (
-            "pay",
-            "payment",
-            "settle",
-            "bayar",
-            "pembayaran",
-            "bayaran",
-            "selesaikan",
-            "还款",
-            "付款",
-            "支付",
-        )
-    ):
-        return False
-    patterns = (
-        r"\b(when|what date|which date)\b.{0,140}\b(pay|payment|settle|make a payment|make payment)\b",
-        r"\b(pay|payment|settle|make a payment|make payment)\b.{0,140}\b(when|what date|which date)\b",
-        r"\b(let me know|tell me|share|provide|give me)\b.{0,140}\b(date|amount|when|how much)\b",
-        r"\bhow much\b.{0,140}\b(pay|payment|settle)\b",
-        r"\b(?:kapan|bila|bilakah|tanggal|tarikh)\b.{0,140}\b(?:bayar|pembayaran|bayaran|melakukan pembayaran|selesaikan)\b",
-        r"\b(?:bayar|pembayaran|bayaran|melakukan pembayaran|selesaikan)\b.{0,140}\b(?:kapan|bila|bilakah|tanggal|tarikh)\b",
-        r"\b(?:berapa)\b.{0,140}\b(?:bayar|pembayaran|bayaran|selesaikan)\b",
-        r"(?:什么时候|哪天|几号|什么日期).{0,80}(?:还款|付款|支付|还|付)",
-        r"(?:还款|付款|支付|还|付).{0,80}(?:什么时候|哪天|几号|什么日期|多少)",
-    )
-    return any(re.search(pattern, lowered) for pattern in patterns)
-
-
-def _failed_payment_collection_user_indices(data: ConversationData, before_index: int) -> list[int]:
-    failed_indices: list[int] = []
-    negotiation_started = False
-    for index, turn in enumerate(data.interactions[:before_index]):
-        if turn.role.lower() == "assistant" and _looks_like_payment_negotiation_turn(turn.content):
-            negotiation_started = True
-            continue
-        if not negotiation_started or turn.role.lower() != "user":
-            continue
-        if _is_failed_payment_collection_response(turn.content):
-            failed_indices.append(index)
-    return failed_indices
-
-
-def _looks_like_payment_negotiation_turn(text: str) -> bool:
-    lowered = text.lower()
-    return (
-        ("overdue" in lowered and ("loan" in lowered or "payment" in lowered))
-        or ("tunggakan" in lowered and ("pinjaman" in lowered or "pembayaran" in lowered or "bayaran" in lowered))
-        or ("逾期" in lowered and ("贷款" in lowered or "款项" in lowered or "还款" in lowered))
-        or "payment hasn't been made" in lowered
-        or _proposes_full_payment_today(text)
-        or _asks_open_ended_payment_terms(text)
-    )
-
-
-def _is_failed_payment_collection_response(text: str) -> bool:
-    return _is_payment_refusal(text) and not _contains_concrete_payment_date(text)
-
-
-def _is_payment_refusal(text: str) -> bool:
-    lowered = _compact_text(text).lower()
-    refusal_patterns = (
-        r"\bno\b",
-        r"\bnot paying\b",
-        r"\bcan't\b",
-        r"\bcannot\b",
-        r"\bcan not\b",
-        r"\bunable\b",
-        r"\bwon't\b",
-        r"\bwill not\b",
-        r"\bdon't have\b",
-        r"\bdo not have\b",
-        r"\bdon't plan\b",
-        r"\bdo not plan\b",
-        r"\bno money\b",
-        r"\bnot able\b",
-        r"\bbelum bisa\b",
-        r"\btidak bisa\b",
-        r"\btidak dapat\b",
-        r"\btak bisa\b",
-        r"\btak boleh\b",
-        r"\btak dapat\b",
-        r"\bbelum boleh\b",
-        r"\bbelum dapat\b",
-        r"\btidak mempunyai\b",
-        r"\btiada duit\b",
-        r"\btak ada duit\b",
-        r"\btidak ada uang\b",
-        r"\btidak ada wang\b",
-        r"(?:没钱|沒有錢|不能还|无法还|还不上|不想还|不还|不能付|无法付|付不了)",
-    )
-    return any(re.search(pattern, lowered) for pattern in refusal_patterns)
-
-
-def _contains_concrete_payment_date(text: str) -> bool:
-    lowered = _compact_text(text).lower()
-    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", lowered):
-        return True
-    if re.search(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", lowered):
-        return True
-    if re.search(r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", lowered):
-        return True
-    if re.search(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?\b", lowered):
-        return True
-    date_terms = (
-        "today",
-        "tomorrow",
-        "monday",
-        "tuesday",
-        "wednesday",
-        "thursday",
-        "friday",
-        "saturday",
-        "sunday",
-        "this weekend",
-        "next week",
-        "next month",
-        "hari ini",
-        "besok",
-        "lusa",
-        "minggu depan",
-        "bulan depan",
-        "tanggal",
-        "tarikh",
-        "今天",
-        "明天",
-        "后天",
-        "下周",
-        "下个月",
-    )
-    return any(term in lowered for term in date_terms)
 
 
 def _format_turn_snippets(data: ConversationData, turn_indices: list[int]) -> str:
@@ -1640,28 +935,6 @@ def _format_turn_snippets(data: ConversationData, turn_indices: list[int]) -> st
         for index in turn_indices
         if 0 <= index < len(data.interactions)
     )
-
-
-def _format_index_list(indices: list[int]) -> str:
-    return ", ".join(str(index) for index in indices)
-
-
-def _payment_term_question_excerpt(text: str) -> str:
-    compacted = _compact_text(text)
-    patterns = (
-        r"could you please [^?.!]*(?:payment|date|when|amount)[^?.!]*[?.!]?",
-        r"please (?:let me know|provide|tell me|share|give me)[^?.!]*(?:payment|date|when|amount)[^?.!]*[?.!]?",
-        r"(?:when|what date|which date)[^?.!]*(?:pay|payment|settle)[^?.!]*[?.!]?",
-        r"(?:how much)[^?.!]*(?:pay|payment|settle)[^?.!]*[?.!]?",
-        r"(?:kapan|bila|bilakah|tanggal|tarikh)[^?.!]*(?:bayar|pembayaran|bayaran|selesaikan)[^?.!]*[?.!]?",
-        r"(?:bayar|pembayaran|bayaran|selesaikan)[^?.!]*(?:kapan|bila|bilakah|tanggal|tarikh)[^?.!]*[?.!]?",
-        r"(?:什么时候|哪天|几号|什么日期)[^?.!]*(?:还款|付款|支付|还|付)[^?.!]*[?.!]?",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, compacted, flags=re.IGNORECASE)
-        if match:
-            return _quote_turn(match.group(0), max_chars=105)
-    return _quote_turn(compacted, max_chars=105)
 
 
 def _quote_turn(text: str, max_chars: int = 150) -> str:
@@ -1718,8 +991,8 @@ def _bad_case_category(case: BadCase) -> str:
             case.recommendation,
         ]
     ).lower()
-    if "promotion" in text and ("search_promotion" in text or "fresh search" in text or "tool" in text):
-        return "missing_fresh_promotion_search"
+    if "tool" in text and ("missing" in text or "without" in text or "required" in text or "must call" in text):
+        return "missing_required_tool_call"
     if "payment" in text and ("open-ended" in text or "when" in text or "how much" in text):
         return "open_ended_payment_terms_after_rejection"
     if ("attempt" in text or "3-attempt" in text or "three" in text) and ("rtp_closing" in text or "state 4.0" in text):
@@ -2610,11 +1883,7 @@ def _contains_required_tool_call(response: str, required_tool: str) -> bool:
     if not response:
         return False
     pattern = rf"<function-call>\s*{re.escape(required_tool)}\s*:"
-    if re.search(pattern, response, flags=re.IGNORECASE):
-        return True
-    if required_tool.lower().endswith("search_promotion"):
-        return _is_search_promotion_tool_call(response)
-    return False
+    return bool(re.search(pattern, response, flags=re.IGNORECASE))
 
 
 def _forced_required_tool_call(required_tool: str, user_message: str) -> str:

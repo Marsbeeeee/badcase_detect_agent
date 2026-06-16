@@ -95,27 +95,30 @@ def test_batch_conclusion_has_three_semantic_parts_with_backend_evidence() -> No
     sections = build_batch_conclusion_sections(conclusion)
     markdown = render_apply_conclusion_markdown(conclusion)
 
-    assert sections["verification_verdict"].startswith("Not fixed.")
-    assert "Root cause analysis:" in sections["badcase_diagnosis_and_backend_evidence"]
-    assert "negotiation/proposal-clarification path" in sections["badcase_diagnosis_and_backend_evidence"]
-    assert "Evidence data (surface):" in sections["badcase_diagnosis_and_backend_evidence"]
-    assert "Evidence data (deep):" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert sections["verification_verdict"].startswith("验证结论：未通过。")
+    assert "### 结论说明" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "#### conversation.json" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "- 实验结论：" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "- 输出观察：" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "- Prompt 修改推导：" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "- Logprob 分析：" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "- 根因判断：" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "- 实验记录：" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "仍未修复" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "用户已经给出应进入终局的付款信息" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "### 剩余风险" in sections["badcase_diagnosis_and_backend_evidence"]
     assert "openai_api_like/voyager-test" in sections["badcase_diagnosis_and_backend_evidence"]
     assert "request-1" in sections["badcase_diagnosis_and_backend_evidence"]
-    assert "avg=-0.01" in sections["badcase_diagnosis_and_backend_evidence"]
-    assert "stable wrong-branch preference" in sections["badcase_diagnosis_and_backend_evidence"]
-    assert "residual scan remains correctness evidence" in sections["badcase_diagnosis_and_backend_evidence"]
-    assert len(sections["badcase_diagnosis_and_backend_evidence"]) < 1800
+    assert "模型稳定选择了当前输出形态" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "正确性仍以 residual scan 为准" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert len(sections["badcase_diagnosis_and_backend_evidence"]) < 3200
     assert "Turn 9 asked for another date." not in sections["verification_verdict"]
-    assert sections["next_action"].startswith(
-        "Primary action: Route recognized beyond-maximum-date triggers through deterministic backend RTP_Closing"
-    )
-    assert "Acceptance criteria:" in sections["next_action"]
+    assert sections["next_action"].startswith("下一步只处理 residual badcase")
+    assert "验收标准" in sections["next_action"]
     assert sections["evidence"][0]["rerun_details"][0]["request_id"] == "request-1"
-    assert markdown.count("## ") == 3
-    assert "## 1. Verification Verdict" in markdown
-    assert "## 2. Badcase Diagnosis And Backend Evidence" in markdown
-    assert "## 3. Next Action" in markdown
+    assert "## 1. 验证结论" in markdown
+    assert "## 2. 诊断与证据" in markdown
+    assert "## 3. 下一步动作" in markdown
 
 
 def test_build_residual_continue_review_uses_conclusion_next_step() -> None:

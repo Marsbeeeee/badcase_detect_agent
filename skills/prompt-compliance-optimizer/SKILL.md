@@ -44,6 +44,15 @@ streamlit run app.py
 - Treat the residual scan as the source of truth. Say `applied changes`, not `fixed`, when violations remain.
 - Do not fabricate missing ground truth, tool results, dates, amounts, hotline text, or business decisions.
 
+## Deterministic Check Generalization
+
+- Local deterministic checks may supplement the LLM judge, but they must be reusable rule-pattern detectors, not scripts tailored to one uploaded system prompt, one dataset, one file, one state name, one fixed utterance, one brand, or one tool name.
+- Do not add prompt-specific detector functions like a hardcoded busy-check, current-year, silence-stop, late-payment, open-ended-payment, or attempt-limit detector unless the implementation first derives the rule, trigger, limits, names, and required behavior from the current `system_prompt`, tool definitions, or structured input.
+- Detector names should describe generic violation patterns such as `missing_required_tool_call`, `workflow_branch_not_followed`, `attempt_limit_exceeded`, or `exact_message_not_used`; avoid names that encode a single business prompt's private workflow.
+- Every new deterministic check must require three evidence surfaces: the prompt rule evidence, the user trigger evidence, and the assistant violation evidence.
+- Every new deterministic check must include at least one positive test, one negative test, and one adjacent-branch regression test proving the detector is not overfit to a single badcase.
+- If a case cannot be generalized without hardcoding a specific prompt's private wording or workflow labels, leave it to the LLM judge plus human review rather than adding a specialized function.
+
 ## Repair Routing
 
 - If the current prompt already contains a clear required-tool rule, prefer a conversation-only target-turn rerun.

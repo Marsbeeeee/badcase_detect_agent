@@ -22,7 +22,9 @@ from prompt_optimizer_agent.rerun_logprobs import (  # noqa: E402
 from prompt_optimizer_agent.json_utils import parse_conversation_json  # noqa: E402
 
 
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "rerun_logprobs"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "skill_scan" / "rerun"
+LATEST_RERUN_UPDATED_JSON = "latest_updated.json"
+LATEST_RERUN_DIAGNOSTICS_JSON = "latest_diagnostics.json"
 
 
 def main() -> int:
@@ -64,16 +66,15 @@ def main() -> int:
 
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
-    run_id = args.run_id or utc_timestamp().replace(":", "").replace(".", "-")
     output_json = (
         Path(args.output_json).expanduser()
         if args.output_json
-        else output_dir / f"{source_path.stem}_{run_id}_updated.json"
+        else output_dir / LATEST_RERUN_UPDATED_JSON
     )
     diagnostics_json = (
         Path(args.diagnostics_json).expanduser()
         if args.diagnostics_json
-        else output_dir / f"{source_path.stem}_{run_id}_diagnostics.json"
+        else output_dir / LATEST_RERUN_DIAGNOSTICS_JSON
     )
     output_json.parent.mkdir(parents=True, exist_ok=True)
     diagnostics_json.parent.mkdir(parents=True, exist_ok=True)
@@ -89,6 +90,7 @@ def main() -> int:
         include_raw_response=not args.no_raw_response,
         include_request_payload=args.include_request_payload,
     )
+    diagnostics["run_id"] = args.run_id or utc_timestamp().replace(":", "").replace(".", "-")
     diagnostics_json.write_text(
         json.dumps(diagnostics, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -140,8 +142,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--transport",
         choices=["auto", "llmparty", "direct"],
-        default="auto",
-        help="Use llmparty APIClient, direct /v1/chat/completions, or auto. Default: auto.",
+        default="direct",
+        help="Use llmparty APIClient, direct /v1/chat/completions, or auto. Default: direct.",
     )
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--max-completion-tokens", type=int, default=4096)

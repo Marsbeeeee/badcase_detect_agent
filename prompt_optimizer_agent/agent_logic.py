@@ -332,12 +332,186 @@ def analyze_bad_cases(
 def _local_prompt_rule_bad_cases(data: ConversationData) -> list[BadCase]:
     """Reusable deterministic checks for explicit hard rules that LLM judges often under-count."""
     cases: list[BadCase] = []
+    cases.extend(_mechanical_detector_bad_cases(data))
     if data.tools is not None:
         cases.extend(_local_undefined_tool_call_cases(data))
     if _prompt_defines_escalation_protocol(data.system_prompt):
         cases.extend(_local_escalation_protocol_cases(data))
     cases.extend(_local_missing_required_tool_call_cases(data))
     return _dedupe_bad_cases(cases)
+
+
+def _mechanical_detector_bad_cases(data: ConversationData) -> list[BadCase]:
+    """Low-false-positive transcript-shape detectors that do not require prompt semantics."""
+    cases: list[BadCase] = []
+    for index, turn in enumerate(data.interactions):
+        if turn.role.lower() != "assistant":
+            continue
+        marker = _exposed_thought_marker(turn.content)
+        if marker is not None:
+            cases.append(
+                BadCase(
+                    turn_index=index,
+                    role="assistant",
+                    error_type="thought_exposed",
+                    evidence=(
+                        "Violated rule: Assistant responses must not expose hidden reasoning or internal "
+                        "thought-channel markers to the user.\n\n"
+                        "Evidence: "
+                        f"Assistant turn {index} contains the internal marker `{marker}` "
+                        f"({_quote_turn(turn.content)})."
+                    ),
+                    recommendation=(
+                        "Regenerate or clean this assistant turn so only the final user-visible answer remains; "
+                        "remove hidden reasoning markers and their enclosed content."
+                    ),
+                    source="mechanical_detector",
+                )
+            )
+        if not turn.content.strip():
+            cases.append(
+                BadCase(
+                    turn_index=index,
+                    role="assistant",
+                    error_type="empty_assistant_response",
+                    evidence=(
+                        "Violated rule: Assistant turns must contain a user-visible response or a valid tool call.\n\n"
+                        f"Evidence: Assistant turn {index} has empty content."
+                    ),
+                    recommendation=(
+                        "Regenerate this assistant turn so it contains the required user-visible response or a "
+                        "well-formed tool call."
+                    ),
+                    source="mechanical_detector",
+                )
+            )
+        malformed_tool_call = _malformed_tool_call_evidence(turn)
+        if malformed_tool_call:
+            cases.append(
+                BadCase(
+                    turn_index=index,
+                    role="assistant",
+                    error_type="malformed_tool_call",
+                    evidence=(
+                        "Violated rule: Assistant tool calls must be syntactically well-formed and use valid JSON "
+                        "arguments.\n\n"
+                        f"Evidence: Assistant turn {index} has a malformed tool call: {malformed_tool_call} "
+                        f"({_quote_turn(turn.content)})."
+                    ),
+                    recommendation=(
+                        "Regenerate or repair the tool call wrapper so it has a function name, a closing "
+                        "</function-call> tag, and valid JSON object arguments."
+                    ),
+                    source="mechanical_detector",
+                )
+            )
+        internal_marker = _internal_marker_leak(turn.content)
+        if internal_marker:
+            cases.append(
+                BadCase(
+                    turn_index=index,
+                    role="assistant",
+                    error_type="internal_marker_leak",
+                    evidence=(
+                        "Violated rule: Assistant responses must not expose backend/internal protocol markers.\n\n"
+                        f"Evidence: Assistant turn {index} contains internal marker `{internal_marker}` "
+                        f"({_quote_turn(turn.content)})."
+                    ),
+                    recommendation=(
+                        "Regenerate or clean this assistant turn so internal protocol markers are removed from "
+                        "the user-visible output."
+                    ),
+                    source="mechanical_detector",
+                )
+            )
+        truncated = _truncated_internal_output_evidence(turn.content)
+        if truncated:
+            cases.append(
+                BadCase(
+                    turn_index=index,
+                    role="assistant",
+                    error_type="truncated_internal_output",
+                    evidence=(
+                        "Violated rule: Assistant output must not stop inside an internal reasoning or loss span.\n\n"
+                        f"Evidence: Assistant turn {index} appears truncated: {truncated} "
+                        f"({_quote_turn(turn.content)})."
+                    ),
+                    recommendation=(
+                        "Regenerate this assistant turn from the target point and keep only the complete final "
+                        "user-visible response."
+                    ),
+                    source="mechanical_detector",
+                )
+            )
+    return cases
+
+
+def _exposed_thought_marker(content: str) -> str | None:
+    text = content or ""
+    for marker in ("thought", "think"):
+        if re.search(rf"<\s*{marker}\s*>.*?<\s*/\s*{marker}\s*>", text, flags=re.IGNORECASE | re.DOTALL):
+            return f"<{marker}>"
+        if re.search(rf"<\s*{marker}\s*>", text, flags=re.IGNORECASE):
+            return f"<{marker}>"
+    return None
+
+
+def _malformed_tool_call_evidence(turn: Interaction) -> str | None:
+    text = turn.content or ""
+    if "<function-call" in text.lower():
+        complete_pattern = re.compile(
+            r"<function-call>\s*([^:<>\s]+)\s*:(.*?)</function-call>",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        matches = list(complete_pattern.finditer(text))
+        opening_count = len(re.findall(r"<function-call\b[^>]*>", text, flags=re.IGNORECASE))
+        if opening_count != len(matches):
+            return "function-call wrapper is missing a valid name, colon, or closing tag"
+        for match in matches:
+            arguments = match.group(2).strip()
+            if arguments and _invalid_tool_arguments_json(arguments):
+                return f"`{match.group(1).strip()}` arguments are not valid JSON"
+    for call in turn.tool_calls or []:
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(function, dict):
+            return "tool_calls entry is missing a function object"
+        name = function.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return "tool_calls function is missing a name"
+        arguments = function.get("arguments")
+        if isinstance(arguments, str) and arguments.strip() and _invalid_tool_arguments_json(arguments):
+            return f"`{name.strip()}` tool_calls arguments are not valid JSON"
+    return None
+
+
+def _invalid_tool_arguments_json(arguments: str) -> bool:
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return True
+    return not isinstance(parsed, dict)
+
+
+def _internal_marker_leak(content: str) -> str | None:
+    text = content or ""
+    for marker in (LOSS_START, LOSS_END, "<|im_start|>", "<|im_end|>"):
+        if marker in text:
+            return marker
+    match = re.search(r"<\|\s*(?:system|user|assistant|tool|analysis|commentary|final)\s*\|>", text, flags=re.IGNORECASE)
+    return match.group(0) if match else None
+
+
+def _truncated_internal_output_evidence(content: str) -> str | None:
+    text = content or ""
+    lower = text.lower()
+    if lower.count(LOSS_START.lower()) != lower.count(LOSS_END.lower()):
+        return f"unbalanced `{LOSS_START}` / `{LOSS_END}` markers"
+    for marker in ("thought", "think"):
+        if re.search(rf"<\s*{marker}\s*>", text, flags=re.IGNORECASE) and not re.search(
+            rf"<\s*/\s*{marker}\s*>", text, flags=re.IGNORECASE
+        ):
+            return f"unclosed `<{marker}>` span"
+    return None
 
 
 def _local_undefined_tool_call_cases(data: ConversationData) -> list[BadCase]:
@@ -974,7 +1148,7 @@ def _merge_manual_and_auto_bad_cases(
 def _bad_case_priority(case: BadCase) -> int:
     if case.source == "human":
         return 30
-    if case.source == "local_scan":
+    if case.source in {"local_scan", "mechanical_detector"}:
         return 20
     return 10
 

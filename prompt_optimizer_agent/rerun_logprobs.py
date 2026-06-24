@@ -38,7 +38,7 @@ class RerunLogprobsSettings:
     max_completion_tokens: int = 4096
     top_logprobs: int = 5
     request_logprobs: bool = True
-    transport: str = "auto"
+    transport: str = "direct"
     timeout_seconds: int = 120
     context_window_turns: int | None = AUTO_RERUN_CONTEXT_WINDOW
     insert_tool_placeholders: bool = True

@@ -153,6 +153,131 @@ def test_local_scan_does_not_emit_prompt_specific_payment_detectors() -> None:
     assert "ptp_attempt_limit_exceeded" not in {case.error_type for case in cases}
 
 
+def test_local_scan_flags_exposed_thought_marker() -> None:
+    data = ConversationData(
+        system_prompt="Only provide the final answer to the user.",
+        interactions=[
+            Interaction(role="user", content="Can you help?"),
+            Interaction(role="assistant", content="<thought>I should reason privately.</thought> Sure, I can help."),
+        ],
+    )
+
+    cases = [
+        case
+        for case in _local_prompt_rule_bad_cases(data)
+        if case.error_type == "thought_exposed"
+    ]
+
+    assert len(cases) == 1
+    assert cases[0].turn_index == 1
+    assert cases[0].source == "mechanical_detector"
+    assert "`<thought>`" in cases[0].evidence
+
+
+def test_local_scan_ignores_user_quoted_thought_marker() -> None:
+    data = ConversationData(
+        system_prompt="Only provide the final answer to the user.",
+        interactions=[
+            Interaction(role="user", content="The log literally says <thought>debug</thought>."),
+            Interaction(role="assistant", content="Thanks, I can review that log excerpt."),
+        ],
+    )
+
+    cases = _local_prompt_rule_bad_cases(data)
+
+    assert "thought_exposed" not in {case.error_type for case in cases}
+
+
+def test_local_scan_ignores_adjacent_non_thought_tag() -> None:
+    data = ConversationData(
+        system_prompt="Only provide the final answer to the user.",
+        interactions=[
+            Interaction(role="user", content="Can you help?"),
+            Interaction(role="assistant", content="<thoughtful>I can help with that.</thoughtful>"),
+        ],
+    )
+
+    cases = _local_prompt_rule_bad_cases(data)
+
+    assert "thought_exposed" not in {case.error_type for case in cases}
+
+
+def test_local_scan_flags_empty_assistant_response() -> None:
+    data = ConversationData(
+        system_prompt="Always provide a response.",
+        interactions=[
+            Interaction(role="user", content="Hello"),
+            Interaction(role="assistant", content="   "),
+        ],
+    )
+
+    cases = _local_prompt_rule_bad_cases(data)
+
+    assert [case.turn_index for case in cases if case.error_type == "empty_assistant_response"] == [1]
+
+
+def test_local_scan_flags_malformed_tool_call_wrapper() -> None:
+    data = ConversationData(
+        system_prompt="Call tools using function-call wrappers.",
+        interactions=[
+            Interaction(role="user", content="Check this."),
+            Interaction(role="assistant", content="<function-call>lookup:{'query':'bad json'}</function-call>"),
+        ],
+    )
+
+    cases = _local_prompt_rule_bad_cases(data)
+
+    malformed = [case for case in cases if case.error_type == "malformed_tool_call"]
+    assert len(malformed) == 1
+    assert malformed[0].source == "mechanical_detector"
+    assert "arguments are not valid JSON" in malformed[0].evidence
+
+
+def test_local_scan_accepts_well_formed_tool_call_wrapper() -> None:
+    data = ConversationData(
+        system_prompt="Call tools using function-call wrappers.",
+        interactions=[
+            Interaction(role="user", content="Check this."),
+            Interaction(role="assistant", content='<function-call>lookup:{"query":"ok"}</function-call>'),
+        ],
+    )
+
+    cases = _local_prompt_rule_bad_cases(data)
+
+    assert "malformed_tool_call" not in {case.error_type for case in cases}
+
+
+def test_local_scan_flags_internal_marker_leak_and_truncated_internal_span() -> None:
+    data = ConversationData(
+        system_prompt="Only provide final user-visible output.",
+        interactions=[
+            Interaction(role="user", content="Hello"),
+            Interaction(role="assistant", content="<|loss_start|>private scoring text"),
+        ],
+    )
+
+    cases = _local_prompt_rule_bad_cases(data)
+    by_type = {case.error_type: case for case in cases}
+
+    assert by_type["internal_marker_leak"].source == "mechanical_detector"
+    assert by_type["truncated_internal_output"].source == "mechanical_detector"
+
+
+def test_local_scan_ignores_adjacent_literal_pipe_text() -> None:
+    data = ConversationData(
+        system_prompt="Only provide final user-visible output.",
+        interactions=[
+            Interaction(role="user", content="Hello"),
+            Interaction(role="assistant", content="Use pipes like | system | only in markdown tables."),
+        ],
+    )
+
+    cases = _local_prompt_rule_bad_cases(data)
+
+    assert "internal_marker_leak" not in {case.error_type for case in cases}
+    assert "truncated_internal_output" not in {case.error_type for case in cases}
+
+
 def test_local_scan_accepts_final_rtp_closing_after_late_payment_date() -> None:
     data = ConversationData(
         system_prompt=(

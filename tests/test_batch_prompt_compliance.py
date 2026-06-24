@@ -1,14 +1,22 @@
 import argparse
 import json
 
+from prompt_optimizer_agent.agent_logic import BadCase, LLMSettings
 from prompt_optimizer_agent.json_utils import ConversationData, Interaction
 from tools.batch_prompt_compliance import (
+    DEFAULT_APPLY_BATCH_ID,
+    DEFAULT_RESIDUAL_CONTINUE_BATCH_ID,
+    DEFAULT_SCAN_BATCH_ID,
     LATEST_APPLY_CONCLUSION_JSON,
     LATEST_APPLY_CONCLUSION_MD,
     LATEST_REVIEW_JSON,
     LATEST_REVIEW_MD,
+    REVIEW_BADCASE_SCHEMA_FIELDS,
+    apply_file_record,
     apply_prompt_cases_with_llm,
+    bad_case_record,
     build_batch_conclusion_sections,
+    build_parser,
     build_residual_continue_review,
     build_verification_failures,
     classify_prompt_edit_failure,
@@ -18,7 +26,10 @@ from tools.batch_prompt_compliance import (
     required_tool_for_case,
     render_apply_conclusion_markdown,
     run_apply,
+    run_rerun_turn,
     run_scan,
+    run_scan_judge,
+    scan_file,
 )
 
 
@@ -41,6 +52,16 @@ def test_batch_conclusion_has_three_semantic_parts_with_backend_evidence() -> No
                 "residual_scan_event_id": "residual-1",
                 "apply_provider": "openai_api_like",
                 "apply_model": "voyager-test",
+                "source_meta": {
+                    "type": "request_log",
+                    "meta": {
+                        "kwargs": {
+                            "provider": "meta-provider",
+                            "model": "meta-model",
+                            "url": "http://meta.example",
+                        }
+                    },
+                },
                 "prompt_changed": True,
                 "before_hash": "before",
                 "after_hash": "after",
@@ -95,6 +116,31 @@ def test_batch_conclusion_has_three_semantic_parts_with_backend_evidence() -> No
     sections = build_batch_conclusion_sections(conclusion)
     markdown = render_apply_conclusion_markdown(conclusion)
 
+    assert sections["verdict_status"] == "not fixed"
+    assert sections["verification_verdict"].startswith("Status: not fixed.")
+    assert "Correctness basis: residual scan results" in sections["verification_verdict"]
+    assert "Root cause analysis" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "Evidence data (surface)" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "Evidence data (deep)" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "`conversation.json` is not verified fixed" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "old=`When can you pay?` new=`Can you pay sooner?`" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "openai_api_like" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "voyager-test" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "request-1" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "source_meta=" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "meta-provider" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "meta-model" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "Logprob boundary: logprobs can explain confidence" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "they cannot prove correctness" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "Turn 9 asked for another date." not in sections["verification_verdict"]
+    assert sections["evidence"][0]["rerun_details"][0]["request_id"] == "request-1"
+    assert "## 1. Verification verdict" in markdown
+    assert "## 2. Badcase diagnosis and backend evidence" in markdown
+    assert "## 3. Next action" in markdown
+    assert markdown.index("## 1. Verification verdict") < markdown.index("## 2. Badcase diagnosis and backend evidence")
+    assert markdown.index("## 2. Badcase diagnosis and backend evidence") < markdown.index("## 3. Next action")
+    return
+
     assert sections["verification_verdict"].startswith("验证结论：未通过。")
     assert "### 结论说明" in sections["badcase_diagnosis_and_backend_evidence"]
     assert "#### conversation.json" in sections["badcase_diagnosis_and_backend_evidence"]
@@ -119,6 +165,33 @@ def test_batch_conclusion_has_three_semantic_parts_with_backend_evidence() -> No
     assert "## 1. 验证结论" in markdown
     assert "## 2. 诊断与证据" in markdown
     assert "## 3. 下一步动作" in markdown
+
+
+def test_rerun_turn_defaults_to_direct_transport() -> None:
+    args = build_parser().parse_args(
+        [
+            "rerun-turn",
+            "--review",
+            "batch_review.json",
+            "--case-id",
+            "case-one",
+        ]
+    )
+
+    assert args.transport == "direct"
+
+
+def test_batch_commands_use_stable_default_batch_ids() -> None:
+    scan_args = build_parser().parse_args(["scan", "conversation.json"])
+    apply_args = build_parser().parse_args(["apply", "batch_review.json", "--approve-all"])
+    continue_args = build_parser().parse_args(["continue-residual", "batch_apply_conclusion.json"])
+
+    assert scan_args.batch_id is None
+    assert apply_args.batch_id is None
+    assert continue_args.batch_id is None
+    assert DEFAULT_SCAN_BATCH_ID == "latest-scan"
+    assert DEFAULT_APPLY_BATCH_ID == "latest-apply"
+    assert DEFAULT_RESIDUAL_CONTINUE_BATCH_ID == "latest-residual-continue"
 
 
 def test_build_residual_continue_review_uses_conclusion_next_step() -> None:
@@ -210,6 +283,306 @@ def test_run_scan_overwrites_latest_review_snapshot(tmp_path, monkeypatch) -> No
     assert review["batch_id"] == "scan-two"
 
 
+def test_scan_file_records_invalid_json_mechanical_badcase(tmp_path) -> None:
+    source = tmp_path / "broken.json"
+    source.write_text('{"system_prompt": "Prompt", "interactions": [', encoding="utf-8")
+
+    record = scan_file(source, judge="local", settings=LLMSettings())
+
+    assert record["status"] == "parse_error"
+    assert record["badcase_count"] == 1
+    assert record["badcases"][0]["error_type"] == "invalid_json"
+    assert record["badcases"][0]["source"] == "mechanical_detector"
+    assert record["badcases"][0]["rerunnable"] is False
+    for field in REVIEW_BADCASE_SCHEMA_FIELDS:
+        assert field in record["badcases"][0]
+
+
+def test_scan_file_records_wrong_turn_role_mechanical_badcase(tmp_path) -> None:
+    source = tmp_path / "wrong_role.json"
+    source.write_text(
+        json.dumps(
+            {
+                "system_prompt": "Prompt",
+                "interactions": [{"role": "developer", "content": "hidden"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    record = scan_file(source, judge="local", settings=LLMSettings())
+
+    assert record["status"] == "parse_error"
+    assert record["badcase_count"] == 1
+    assert record["badcases"][0]["error_type"] == "wrong_turn_role"
+
+
+def test_bad_case_record_marks_local_scan_as_deterministic_source() -> None:
+    record = bad_case_record(
+        BadCase(
+            turn_index=26,
+            role="assistant",
+            error_type="missing_required_tool_call",
+            evidence=(
+                "Violated rule: Must call search before answering.\n\n"
+                "Evidence: User turn 25 asked about a promotion. Assistant turn 26 answered without search."
+            ),
+            recommendation="Call the required tool before answering.",
+            source="local_scan",
+        )
+    )
+
+    assert list(record)[: len(REVIEW_BADCASE_SCHEMA_FIELDS)] == list(REVIEW_BADCASE_SCHEMA_FIELDS)
+    assert record["source"] == "deterministic_rule_detector"
+    assert record["original_source"] == "local_scan"
+    assert record["violated_rule"] == "Must call search before answering."
+    assert record["user_trigger"] == "User turn 25 asked about a promotion."
+    assert record["assistant_violation"] == "Assistant turn 26 answered without search."
+    assert record["rerunnable"] is True
+
+
+def test_bad_case_record_marks_ai_judge_as_semantic_source() -> None:
+    record = bad_case_record(
+        BadCase(
+            turn_index=3,
+            role="assistant",
+            error_type="workflow_branch_not_followed",
+            evidence="Violated rule: Follow branch B.\n\nEvidence: Assistant turn 3 followed branch A.",
+            recommendation="Follow branch B.",
+            source="ai_judge",
+        )
+    )
+
+    assert record["source"] == "codex_semantic_judge"
+    assert record["original_source"] == "ai_judge"
+
+
+def test_run_scan_normalizes_legacy_badcase_dicts_before_writing_review(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "conversation.json"
+    source.write_text("{}", encoding="utf-8")
+    output_dir = tmp_path / "scan"
+    log_path = tmp_path / "rounds.jsonl"
+
+    monkeypatch.setattr(
+        "tools.batch_prompt_compliance.scan_file",
+        lambda path, **kwargs: {
+            "path": str(path),
+            "file_name": path.name,
+            "status": "scanned",
+            "badcase_count": 1,
+            "badcases": [
+                {
+                    "turn_index": 26,
+                    "role": "assistant",
+                    "error_type": "missing_required_tool_call",
+                    "source": "local_scan",
+                    "evidence": (
+                        "Violated rule: Must call search before answering.\n\n"
+                        "Evidence: User turn 25 asked about a promotion. "
+                        "Assistant turn 26 answered without search."
+                    ),
+                    "recommendation": "Call the required tool before answering.",
+                }
+            ],
+        },
+    )
+
+    args = argparse.Namespace(
+        paths=[str(source)],
+        pattern="*.json",
+        no_recursive=False,
+        judge="local",
+        model=None,
+        output_dir=str(output_dir),
+        log=str(log_path),
+        batch_id="scan-one",
+    )
+
+    assert run_scan(args) == 0
+
+    review = json.loads((output_dir / LATEST_REVIEW_JSON).read_text(encoding="utf-8"))
+    case = review["files"][0]["badcases"][0]
+    assert list(case)[: len(REVIEW_BADCASE_SCHEMA_FIELDS)] == list(REVIEW_BADCASE_SCHEMA_FIELDS)
+    assert case["source"] == "deterministic_rule_detector"
+    assert case["original_source"] == "local_scan"
+    assert case["violated_rule"] == "Must call search before answering."
+    assert case["user_trigger"] == "User turn 25 asked about a promotion."
+    assert case["assistant_violation"] == "Assistant turn 26 answered without search."
+    assert case["rerunnable"] is True
+
+
+def test_run_scan_judge_outputs_only_semantic_badcases_from_skeleton(tmp_path, monkeypatch, capsys) -> None:
+    skeleton = {
+        "source_file": "conversation.json",
+        "file_hash": "file-hash",
+        "system_prompt_hash": "prompt-hash",
+        "system_prompt": "Always call lookup before answering promotion questions.",
+        "turns": [
+            {"role": "user", "content": "Any promotion?"},
+            {"role": "assistant", "content": "Yes, there is one."},
+        ],
+        "tools": {"lookup": {"type": "function", "function": {"name": "lookup"}}},
+    }
+    skeleton_path = tmp_path / "skeleton.json"
+    output_path = tmp_path / "semantic.json"
+    skeleton_path.write_text(json.dumps(skeleton), encoding="utf-8")
+
+    monkeypatch.setattr(
+        "tools.batch_prompt_compliance._local_prompt_rule_bad_cases",
+        lambda data: [
+            BadCase(
+                turn_index=1,
+                role="assistant",
+                error_type="thought_exposed",
+                evidence="mechanical",
+                recommendation="clean",
+                source="mechanical_detector",
+            ),
+            BadCase(
+                turn_index=1,
+                role="assistant",
+                error_type="missing_required_tool_call",
+                evidence=(
+                    "Violated rule: Always call lookup before answering promotion questions.\n\n"
+                    "Evidence: User turn 0 asked about a promotion. Assistant turn 1 answered without lookup."
+                ),
+                recommendation="Call lookup before answering.",
+                source="local_scan",
+            ),
+        ],
+    )
+
+    args = argparse.Namespace(
+        skeleton_json=str(skeleton_path),
+        judge="local",
+        model=None,
+        output=str(output_path),
+    )
+
+    assert run_scan_judge(args) == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    case = payload["badcases"][0]
+
+    assert payload["mode"] == "scan_judge"
+    assert payload["badcase_count"] == 1
+    assert case["error_type"] == "missing_required_tool_call"
+    assert case["source"] == "deterministic_rule_detector"
+    assert case["original_source"] == "local_scan"
+    assert case["violated_rule"] == "Always call lookup before answering promotion questions."
+    assert json.loads(capsys.readouterr().out)["output"] == str(output_path)
+
+
+def test_run_rerun_turn_reads_case_from_review_and_writes_outputs(tmp_path, monkeypatch, capsys) -> None:
+    source = tmp_path / "conversation.json"
+    source.write_text(
+        json.dumps(
+            {
+                "system_prompt": "Answer briefly.",
+                "interactions": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "old"},
+                ],
+                "tools": {"lookup": {"type": "function", "function": {"name": "lookup"}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    review_path = tmp_path / "batch_review.json"
+    review_path.write_text(
+        json.dumps(
+            {
+                "batch_id": "scan-one",
+                "files": [
+                    {
+                        "path": str(source),
+                        "scan_event_id": "scan-one-scan-0001",
+                        "badcases": [
+                            {
+                                "id": "case-one",
+                                "turn_index": 1,
+                                "role": "assistant",
+                                "rerunnable": True,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_json = tmp_path / "updated.json"
+    diagnostics_json = tmp_path / "diagnostics.json"
+    calls = []
+
+    class FakeResult:
+        updated_data = ConversationData(
+            system_prompt="Answer briefly.",
+            interactions=[
+                Interaction(role="user", content="hello"),
+                Interaction(role="assistant", content="new"),
+            ],
+            tools={"lookup": {"type": "function", "function": {"name": "lookup"}}},
+        )
+
+        def diagnostics_payload(self, **kwargs):
+            return {
+                "source_path": kwargs["source_path"],
+                "output_path": kwargs["output_path"],
+                "target_turns": [1],
+                "settings": {"model": kwargs["settings"].model},
+                "aggregate": {
+                    "result_count": 1,
+                    "error_count": 0,
+                    "logprobs_available_count": 1,
+                },
+                "results": [],
+            }
+
+    def fake_rerun(**kwargs):
+        calls.append(kwargs)
+        return FakeResult()
+
+    monkeypatch.setattr("tools.batch_prompt_compliance.rerun_target_turns_with_logprobs", fake_rerun)
+
+    args = argparse.Namespace(
+        review=str(review_path),
+        case_id="case-one",
+        url="http://example.invalid",
+        provider="openai_api_like",
+        model="voyager-test",
+        transport="direct",
+        temperature=0.1,
+        max_completion_tokens=128,
+        top_logprobs=3,
+        no_logprobs=False,
+        context_window_turns=-1,
+        timeout_seconds=30,
+        no_tool_placeholders=False,
+        output_dir=str(tmp_path),
+        output_json=str(output_json),
+        diagnostics_json=str(diagnostics_json),
+        run_id="run-one",
+        no_raw_response=True,
+        include_request_payload=False,
+    )
+
+    assert run_rerun_turn(args) == 0
+
+    assert calls[0]["target_assistant_turn_indices"] == {1}
+    assert calls[0]["data"].system_prompt == "Answer briefly."
+    assert calls[0]["data"].tools["lookup"]["function"]["name"] == "lookup"
+    assert calls[0]["settings"].model == "voyager-test"
+    updated = json.loads(output_json.read_text(encoding="utf-8"))
+    diagnostics = json.loads(diagnostics_json.read_text(encoding="utf-8"))
+    printed = json.loads(capsys.readouterr().out)
+
+    assert updated["interactions"][1]["content"] == "new"
+    assert diagnostics["case_id"] == "case-one"
+    assert diagnostics["scan_event_id"] == "scan-one-scan-0001"
+    assert printed["updated_json"] == str(output_json)
+    assert printed["target_turns"] == [1]
+
+
 def test_run_apply_writes_latest_snapshot_without_batch_subdirectory(tmp_path, monkeypatch) -> None:
     review_path = tmp_path / "batch_review.json"
     review_path.write_text(
@@ -262,6 +635,49 @@ def test_run_apply_writes_latest_snapshot_without_batch_subdirectory(tmp_path, m
         LATEST_APPLY_CONCLUSION_MD,
     ]
     assert not (output_dir / "apply-one").exists()
+
+
+def test_apply_file_record_preserves_source_meta_for_conclusion(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "conversation.json"
+    source.write_text(
+        json.dumps(
+            {
+                "system_prompt": "Call lookup before answering.",
+                "interactions": [
+                    {"role": "user", "content": "Any promotion?"},
+                    {"role": "assistant", "content": "Yes."},
+                ],
+                "tools": {"lookup": {"type": "function", "function": {"name": "lookup"}}},
+                "source_meta": {
+                    "type": "request_log",
+                    "meta": {"kwargs": {"provider": "meta-provider", "model": "meta-model"}},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    file_record = {
+        "path": str(source),
+        "badcases": [
+            {
+                "id": "case-one",
+                "turn_index": 1,
+                "role": "assistant",
+                "error_type": "missing_required_tool_call",
+            }
+        ],
+    }
+    monkeypatch.setattr("tools.batch_prompt_compliance.required_tool_for_case", lambda *args, **kwargs: "lookup")
+
+    result = apply_file_record(
+        file_record,
+        {"case-one"},
+        tmp_path,
+        argparse.Namespace(),
+    )
+
+    assert result["source_meta"]["type"] == "request_log"
+    assert result["source_meta"]["meta"]["kwargs"]["provider"] == "meta-provider"
 
 
 def conversation_with_transfer_tool() -> ConversationData:

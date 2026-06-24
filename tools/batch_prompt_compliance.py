@@ -34,6 +34,11 @@ from prompt_optimizer_agent.json_utils import (  # noqa: E402
     function_call_wrappers_to_tool_calls,
     parse_conversation_json,
 )
+from prompt_optimizer_agent.rerun_logprobs import (  # noqa: E402
+    RerunLogprobsSettings,
+    rerun_target_turns_with_logprobs,
+    utc_timestamp as rerun_utc_timestamp,
+)
 
 
 SKIP_DIR_NAMES = {
@@ -52,19 +57,44 @@ SKIP_DIR_NAMES = {
 def as_file_uri(path: Path) -> str:
     return path.resolve().as_uri()
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "batch"
+DEFAULT_RERUN_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "skill_scan" / "rerun"
 DEFAULT_ROUND_LOG = PROJECT_ROOT / "logs" / "optimization_rounds.jsonl"
 LATEST_REVIEW_JSON = "batch_review.json"
 LATEST_REVIEW_MD = "batch_review.md"
 LATEST_APPLY_CONCLUSION_JSON = "batch_apply_conclusion.json"
 LATEST_APPLY_CONCLUSION_MD = "batch_apply_conclusion.md"
+LATEST_RERUN_UPDATED_JSON = "latest_updated.json"
+LATEST_RERUN_DIAGNOSTICS_JSON = "latest_diagnostics.json"
+DEFAULT_SCAN_BATCH_ID = "latest-scan"
+DEFAULT_APPLY_BATCH_ID = "latest-apply"
+DEFAULT_RESIDUAL_CONTINUE_BATCH_ID = "latest-residual-continue"
 REVIEW_SNAPSHOT_PATTERNS = ("*_review.json", "*_review.md")
 APPLY_SNAPSHOT_PATTERNS = ("*_updated.json", "*_conclusion.json", "*_conclusion.md")
+REVIEW_BADCASE_SCHEMA_FIELDS = (
+    "id",
+    "turn_index",
+    "role",
+    "error_type",
+    "source",
+    "violated_rule",
+    "user_trigger",
+    "assistant_violation",
+    "evidence",
+    "recommendation",
+    "rerunnable",
+)
+REVIEW_SEMANTIC_SOURCE = "codex_semantic_judge"
+REVIEW_DETERMINISTIC_SOURCE = "deterministic_rule_detector"
 
 
 def main() -> int:
     args = build_parser().parse_args()
     if args.command == "scan":
         return run_scan(args)
+    if args.command == "scan-judge":
+        return run_scan_judge(args)
+    if args.command == "rerun-turn":
+        return run_rerun_turn(args)
     if args.command == "apply":
         return run_apply(args)
     if args.command == "continue-residual":
@@ -91,6 +121,53 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scan.add_argument("--log", default=str(DEFAULT_ROUND_LOG))
     scan.add_argument("--batch-id", default=None)
+
+    scan_judge = subparsers.add_parser(
+        "scan-judge",
+        help="Run only semantic judging over a scan-prep skeleton and emit schema-normalized badcases.",
+    )
+    scan_judge.add_argument("skeleton_json", help="Path to a scan-prep skeleton JSON file.")
+    scan_judge.add_argument("--judge", choices=["local", "company", "openai"], default="local")
+    scan_judge.add_argument("--model", default=None, help="Override model for company/openai judge.")
+    scan_judge.add_argument("--output", default=None, help="Optional path for the semantic badcase JSON payload.")
+
+    rerun_turn = subparsers.add_parser(
+        "rerun-turn",
+        help="Rerun the assistant turn referenced by a review case id.",
+    )
+    rerun_turn.add_argument("--review", required=True, help="Path to batch_review.json.")
+    rerun_turn.add_argument("--case-id", required=True, help="Badcase id to rerun.")
+    rerun_turn.add_argument("--url", default=DEFAULT_COMPANY_URL, help="Chat completions base URL.")
+    rerun_turn.add_argument("--provider", default=DEFAULT_COMPANY_PROVIDER, help="llmparty provider.")
+    rerun_turn.add_argument("--model", default=DEFAULT_COMPANY_MODEL, help="Model name.")
+    rerun_turn.add_argument(
+        "--transport",
+        choices=["auto", "llmparty", "direct"],
+        default="direct",
+        help="Use llmparty APIClient, direct /v1/chat/completions, or auto. Default: direct.",
+    )
+    rerun_turn.add_argument("--temperature", type=float, default=0.2)
+    rerun_turn.add_argument("--max-completion-tokens", type=int, default=4096)
+    rerun_turn.add_argument("--top-logprobs", type=int, default=5)
+    rerun_turn.add_argument("--no-logprobs", action="store_true", help="Do not request logprobs.")
+    rerun_turn.add_argument(
+        "--context-window-turns",
+        type=int,
+        default=-1,
+        help="Rerun context window. -1 keeps the app-style auto window; 0 keeps full context.",
+    )
+    rerun_turn.add_argument("--timeout-seconds", type=int, default=120)
+    rerun_turn.add_argument(
+        "--no-tool-placeholders",
+        action="store_true",
+        help="Do not insert not_executed tool placeholder turns after generated tool calls.",
+    )
+    rerun_turn.add_argument("--output-dir", default=str(DEFAULT_RERUN_OUTPUT_DIR))
+    rerun_turn.add_argument("--output-json", default=None)
+    rerun_turn.add_argument("--diagnostics-json", default=None)
+    rerun_turn.add_argument("--run-id", default=None)
+    rerun_turn.add_argument("--no-raw-response", action="store_true")
+    rerun_turn.add_argument("--include-request-payload", action="store_true")
 
     apply = subparsers.add_parser("apply", help="Apply approved cases from a batch review file.")
     apply.add_argument("review_json", nargs="?", help="Path to batch_review.json produced by scan.")
@@ -153,7 +230,7 @@ def run_scan(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     cleanup_generated_snapshots(output_dir, REVIEW_SNAPSHOT_PATTERNS)
-    batch_id = args.batch_id or new_batch_id("batch-scan")
+    batch_id = args.batch_id or DEFAULT_SCAN_BATCH_ID
     judge_settings = build_judge_settings(args)
 
     records = []
@@ -161,6 +238,7 @@ def run_scan(args: argparse.Namespace) -> int:
         record = scan_file(path, judge=args.judge, settings=judge_settings)
         record["scan_event_id"] = f"{batch_id}-scan-{index:04d}"
         record["batch_id"] = batch_id
+        record = normalize_review_file_record(record)
         records.append(record)
         append_round_event(Path(args.log).expanduser(), scan_round_event(record))
 
@@ -203,6 +281,136 @@ def run_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_scan_judge(args: argparse.Namespace) -> int:
+    skeleton_path = Path(args.skeleton_json).expanduser()
+    skeleton = json.loads(skeleton_path.read_text(encoding="utf-8"))
+    if not isinstance(skeleton, dict):
+        raise SystemExit("scan-judge input must be a JSON object produced by scan-prep.")
+
+    data = conversation_data_from_scan_prep_skeleton(skeleton)
+    settings = build_judge_settings(args)
+    cases = semantic_badcase_records_for_data(data, judge=args.judge, settings=settings)
+    payload = {
+        "created_at": utc_timestamp(),
+        "mode": "scan_judge",
+        "judge": args.judge,
+        "skeleton_path": str(skeleton_path),
+        "source_file": skeleton.get("source_file") or skeleton.get("path"),
+        "file_hash": skeleton.get("file_hash"),
+        "system_prompt_hash": skeleton.get("system_prompt_hash") or sha1_text(data.system_prompt),
+        "turn_count": len(data.interactions),
+        "tools_count": len(data.tools or {}),
+        "badcase_count": len(cases),
+        "badcases": cases,
+    }
+    if skeleton.get("scan_event_id"):
+        payload["scan_event_id"] = skeleton.get("scan_event_id")
+    if args.output:
+        output_path = Path(args.output).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload["output"] = str(output_path)
+        payload["output_uri"] = as_file_uri(output_path)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def run_rerun_turn(args: argparse.Namespace) -> int:
+    review_path = Path(args.review).expanduser()
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    file_record, case = review_case_by_id(review, args.case_id)
+    target_turn = _review_turn_index(case.get("turn_index"))
+    if target_turn < 0:
+        raise SystemExit(f"Case {args.case_id} does not contain a valid assistant turn_index.")
+    if case.get("rerunnable") is False:
+        raise SystemExit(f"Case {args.case_id} is marked rerunnable=false.")
+
+    source_path = review_file_record_source_path(file_record)
+    raw = source_path.read_text(encoding="utf-8")
+    parsed = parse_conversation_json(raw)
+    if parsed.error or parsed.data is None:
+        raise SystemExit(parsed.error or f"Could not parse source conversation: {source_path}")
+
+    settings = RerunLogprobsSettings(
+        model=args.model,
+        provider=args.provider,
+        url=args.url,
+        temperature=args.temperature,
+        max_completion_tokens=args.max_completion_tokens,
+        top_logprobs=args.top_logprobs,
+        request_logprobs=not args.no_logprobs,
+        transport=args.transport,
+        timeout_seconds=args.timeout_seconds,
+        context_window_turns=args.context_window_turns,
+        insert_tool_placeholders=not args.no_tool_placeholders,
+    )
+    result = rerun_target_turns_with_logprobs(
+        data=parsed.data,
+        optimized_prompt=parsed.data.system_prompt,
+        target_assistant_turn_indices={target_turn},
+        settings=settings,
+    )
+
+    output_dir = Path(args.output_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_json = (
+        Path(args.output_json).expanduser()
+        if args.output_json
+        else output_dir / LATEST_RERUN_UPDATED_JSON
+    )
+    diagnostics_json = (
+        Path(args.diagnostics_json).expanduser()
+        if args.diagnostics_json
+        else output_dir / LATEST_RERUN_DIAGNOSTICS_JSON
+    )
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics_json.parent.mkdir(parents=True, exist_ok=True)
+
+    output_json.write_text(
+        json.dumps(conversation_payload(result.updated_data), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    diagnostics = result.diagnostics_payload(
+        source_path=str(source_path),
+        output_path=str(output_json),
+        settings=settings,
+        include_raw_response=not args.no_raw_response,
+        include_request_payload=args.include_request_payload,
+    )
+    diagnostics.update(
+        {
+            "review_path": str(review_path),
+            "case_id": str(args.case_id),
+            "run_id": args.run_id or rerun_utc_timestamp().replace(":", "").replace(".", "-"),
+            "scan_event_id": file_record.get("scan_event_id"),
+            "review_batch_id": review.get("batch_id"),
+        }
+    )
+    diagnostics_json.write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(
+        json.dumps(
+            {
+                "review": str(review_path),
+                "case_id": str(args.case_id),
+                "source": str(source_path),
+                "updated_json": str(output_json),
+                "diagnostics_json": str(diagnostics_json),
+                "target_turns": [target_turn],
+                "result_count": diagnostics["aggregate"]["result_count"],
+                "error_count": diagnostics["aggregate"]["error_count"],
+                "logprobs_available_count": diagnostics["aggregate"]["logprobs_available_count"],
+                "logprobs_requested": not args.no_logprobs,
+                "top_logprobs": None if args.no_logprobs else args.top_logprobs,
+                "transport": args.transport,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def run_apply(args: argparse.Namespace) -> int:
     if args.list_models:
         print_company_model_candidates(args)
@@ -213,7 +421,7 @@ def run_apply(args: argparse.Namespace) -> int:
 
     review_path = Path(args.review_json).expanduser()
     review = json.loads(review_path.read_text(encoding="utf-8"))
-    batch_id = args.batch_id or f"{review.get('batch_id', 'batch')}-apply"
+    batch_id = args.batch_id or DEFAULT_APPLY_BATCH_ID
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     cleanup_generated_snapshots(output_dir, APPLY_SNAPSHOT_PATTERNS)
@@ -282,7 +490,7 @@ def run_continue_residual(args: argparse.Namespace) -> int:
 
     conclusion_path = Path(args.conclusion_json).expanduser()
     conclusion = json.loads(conclusion_path.read_text(encoding="utf-8"))
-    batch_id = args.batch_id or f"{conclusion.get('batch_id', 'batch')}-residual-continue"
+    batch_id = args.batch_id or DEFAULT_RESIDUAL_CONTINUE_BATCH_ID
     output_dir = Path(args.review_output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     cleanup_generated_snapshots(output_dir, REVIEW_SNAPSHOT_PATTERNS)
@@ -335,6 +543,67 @@ def run_continue_residual(args: argparse.Namespace) -> int:
     return 0
 
 
+def conversation_data_from_scan_prep_skeleton(skeleton: dict[str, Any]) -> ConversationData:
+    """Load the fixed scan-prep skeleton shape used by scan-judge."""
+    system_prompt = skeleton.get("system_prompt")
+    turns = skeleton.get("turns")
+    if not isinstance(system_prompt, str) or not system_prompt.strip():
+        raise SystemExit("scan-judge skeleton must contain a non-empty string field: system_prompt.")
+    if not isinstance(turns, list):
+        raise SystemExit("scan-judge skeleton must contain a list field: turns.")
+    try:
+        return ConversationData.model_validate(
+            {
+                "system_prompt": system_prompt,
+                "interactions": turns,
+                "tools": skeleton.get("tools"),
+                "source_meta": skeleton.get("metadata") if isinstance(skeleton.get("metadata"), dict) else None,
+            }
+        )
+    except Exception as exc:
+        raise SystemExit(f"scan-judge skeleton failed schema validation: {exc}") from exc
+
+
+def review_case_by_id(review: dict[str, Any], case_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for file_record in review.get("files") or []:
+        if not isinstance(file_record, dict):
+            continue
+        for case in file_record.get("badcases") or []:
+            if isinstance(case, dict) and str(case.get("id") or "") == str(case_id):
+                matches.append((file_record, case))
+    if not matches:
+        raise SystemExit(f"Case id not found in review: {case_id}")
+    if len(matches) > 1:
+        raise SystemExit(f"Case id is not unique in review: {case_id}")
+    return matches[0]
+
+
+def review_file_record_source_path(file_record: dict[str, Any]) -> Path:
+    path_value = file_record.get("path") or file_record.get("source_file") or file_record.get("updated_file")
+    if not path_value:
+        raise SystemExit("Review file record does not contain path/source_file/updated_file.")
+    path = Path(str(path_value)).expanduser()
+    if not path.is_file():
+        raise SystemExit(f"Source conversation file not found: {path}")
+    return path
+
+
+def semantic_badcase_records_for_data(
+    data: ConversationData,
+    *,
+    judge: str,
+    settings: LLMSettings,
+) -> list[dict[str, Any]]:
+    cases = _local_prompt_rule_bad_cases(data) if judge == "local" else analyze_bad_cases(data, llm_settings=settings)
+    semantic_cases = [
+        case
+        for case in cases
+        if case.turn_index >= 0 and case.role.lower() == "assistant" and case.source != "mechanical_detector"
+    ]
+    return [bad_case_record(case) for case in semantic_cases]
+
+
 def build_residual_continue_review(conclusion: dict[str, Any], *, batch_id: str) -> dict[str, Any]:
     sections = conclusion.get("conclusion_sections") or build_batch_conclusion_sections(conclusion)
     records: list[dict[str, Any]] = []
@@ -366,7 +635,7 @@ def build_residual_continue_review(conclusion: dict[str, Any], *, batch_id: str)
             case_copy["parent_case_id"] = failure.get("case_id")
             case_copy["parent_apply_batch_id"] = conclusion.get("batch_id")
             case_copy["source"] = case_copy.get("source") or "residual_continue"
-            continued_cases.append(case_copy)
+            continued_cases.append(normalize_review_badcase_record(case_copy))
         record = {
             "path": updated_file,
             "file_name": Path(updated_file).name if updated_file else str(item.get("source_file") or "unknown"),
@@ -446,6 +715,7 @@ def should_skip(path: Path) -> bool:
 def scan_file(path: Path, *, judge: str, settings: LLMSettings) -> dict[str, Any]:
     raw = path.read_text(encoding="utf-8")
     parsed = parse_conversation_json(raw)
+    parse_badcases = mechanical_parse_badcase_records(parsed.error)
     base = {
         "path": str(path),
         "file_name": path.name,
@@ -453,8 +723,8 @@ def scan_file(path: Path, *, judge: str, settings: LLMSettings) -> dict[str, Any
         "status": "parsed" if parsed.error is None and parsed.data is not None else "parse_error",
         "warnings": parsed.warnings,
         "parse_error": parsed.error,
-        "badcase_count": 0,
-        "badcases": [],
+        "badcase_count": len(parse_badcases),
+        "badcases": parse_badcases,
     }
     if parsed.error or parsed.data is None:
         return base
@@ -477,6 +747,42 @@ def scan_file(path: Path, *, judge: str, settings: LLMSettings) -> dict[str, Any
         }
     )
     return base
+
+
+def mechanical_parse_badcase_records(parse_error: str | None) -> list[dict[str, Any]]:
+    if not parse_error:
+        return []
+    lowered = parse_error.lower()
+    if "role must be one of" in lowered:
+        case = BadCase(
+            turn_index=-1,
+            role="file",
+            error_type="wrong_turn_role",
+            evidence=(
+                "Violated rule: Conversation turns must use one of the supported roles: "
+                "system, user, assistant, or tool.\n\n"
+                f"Evidence: Parser rejected the file with: {parse_error}"
+            ),
+            recommendation=(
+                "Normalize every turn role to one of system/user/assistant/tool before running semantic review."
+            ),
+            source="mechanical_detector",
+        )
+        return [bad_case_record(case)]
+    if "json syntax error" in lowered or "uploaded file is empty" in lowered:
+        case = BadCase(
+            turn_index=-1,
+            role="file",
+            error_type="invalid_json",
+            evidence=(
+                "Violated rule: Scan inputs must be valid JSON or a conservatively repairable JSON-like export.\n\n"
+                f"Evidence: Parser rejected the file with: {parse_error}"
+            ),
+            recommendation="Repair the JSON syntax before running prompt-compliance review.",
+            source="mechanical_detector",
+        )
+        return [bad_case_record(case)]
+    return []
 
 
 def apply_file_record(
@@ -562,6 +868,7 @@ def apply_file_record(
             "after_hash": sha1_text(updated_data.system_prompt),
             "before_version": "external Original",
             "after_version": "batch Apply" if updated_data.system_prompt != data.system_prompt else "external Original",
+            "source_meta": data.source_meta,
             "residual_badcase_count": len(residual_cases),
             "residual_badcases": residual_cases,
             "fixed_case_count": fixed_case_count,
@@ -1490,8 +1797,133 @@ def bad_case_record(case: BadCase) -> dict[str, Any]:
         "evidence": case.evidence,
         "recommendation": case.recommendation,
     }
-    record["id"] = bad_case_id(record)
-    return record
+    return normalize_review_badcase_record(record)
+
+
+def normalize_review_badcase_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the stable review badcase schema while preserving legacy extras."""
+    normalized = dict(record)
+    original_source = str(normalized.get("source") or "")
+    normalized["turn_index"] = _review_turn_index(normalized.get("turn_index"))
+    normalized["role"] = str(normalized.get("role") or "assistant")
+    normalized["error_type"] = str(normalized.get("error_type") or "unknown")
+    normalized["source"] = review_case_source(original_source)
+    if original_source and original_source != normalized["source"]:
+        normalized.setdefault("original_source", original_source)
+    normalized["evidence"] = str(normalized.get("evidence") or "")
+    normalized["recommendation"] = str(normalized.get("recommendation") or "")
+    normalized["violated_rule"] = str(
+        normalized.get("violated_rule") or review_case_violated_rule(normalized)
+    )
+    normalized["user_trigger"] = str(normalized.get("user_trigger") or review_case_user_trigger(normalized))
+    normalized["assistant_violation"] = str(
+        normalized.get("assistant_violation") or review_case_assistant_violation(normalized)
+    )
+    normalized["rerunnable"] = bool(
+        normalized.get("rerunnable")
+        if "rerunnable" in normalized
+        else review_case_is_rerunnable(normalized)
+    )
+    normalized["id"] = str(normalized.get("id") or bad_case_id(normalized))
+    return {
+        **{field: normalized.get(field) for field in REVIEW_BADCASE_SCHEMA_FIELDS},
+        **{key: value for key, value in normalized.items() if key not in REVIEW_BADCASE_SCHEMA_FIELDS},
+    }
+
+
+def normalize_review_file_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Normalize all badcase-like entries before a file record enters review JSON."""
+    normalized = dict(record)
+    badcases = [
+        normalize_review_badcase_record(case)
+        for case in normalized.get("badcases") or []
+        if isinstance(case, dict)
+    ]
+    analysis_errors = [
+        normalize_review_badcase_record(case)
+        for case in normalized.get("analysis_errors") or []
+        if isinstance(case, dict)
+    ]
+    normalized["badcases"] = badcases
+    normalized["badcase_count"] = len(badcases)
+    normalized["analysis_errors"] = analysis_errors
+    normalized["analysis_error_count"] = len(analysis_errors)
+    return normalized
+
+
+def _review_turn_index(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
+def review_case_source(source: str) -> str:
+    normalized = source.strip().lower()
+    if normalized == "mechanical_detector":
+        return "mechanical_detector"
+    if normalized in {"local_scan", REVIEW_DETERMINISTIC_SOURCE, "deterministic_scan", "residual_continue"}:
+        return REVIEW_DETERMINISTIC_SOURCE
+    if normalized == "human":
+        return "human"
+    return REVIEW_SEMANTIC_SOURCE
+
+
+def review_case_violated_rule(record: dict[str, Any]) -> str:
+    evidence = str(record.get("evidence") or "").strip()
+    match = re.search(r"Violated rule:\s*(.*?)(?:\n\s*\n|Evidence:|$)", evidence, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return _single_line(match.group(1))
+    if record.get("source") == "mechanical_detector":
+        return _mechanical_rule_for_error_type(str(record.get("error_type") or "unknown"))
+    if record.get("source") == REVIEW_DETERMINISTIC_SOURCE:
+        return "Explicit system-prompt or tool rule identified by a deterministic detector."
+    return "Explicit system-prompt compliance rule identified by the semantic judge."
+
+
+def review_case_user_trigger(record: dict[str, Any]) -> str:
+    evidence = str(record.get("evidence") or "").strip()
+    match = re.search(r"(User turn \d+[^.。]*(?:[.。]|$))", evidence, flags=re.IGNORECASE)
+    if match:
+        return _single_line(match.group(1))
+    if int(record.get("turn_index") or -1) < 0:
+        return "Input file structure or syntax prevented turn-level review."
+    return "See evidence for the triggering user or conversation context."
+
+
+def review_case_assistant_violation(record: dict[str, Any]) -> str:
+    evidence = str(record.get("evidence") or "").strip()
+    turn_index = int(record.get("turn_index") or -1)
+    if turn_index >= 0:
+        marker = f"Assistant turn {turn_index}"
+        marker_index = evidence.lower().find(marker.lower())
+        if marker_index >= 0:
+            return _single_line(evidence[marker_index:])
+    evidence_match = re.search(r"Evidence:\s*(.*)$", evidence, flags=re.IGNORECASE | re.DOTALL)
+    if evidence_match:
+        return _single_line(evidence_match.group(1))
+    return _single_line(evidence) if evidence else "No assistant violation text was provided."
+
+
+def review_case_is_rerunnable(record: dict[str, Any]) -> bool:
+    return int(record.get("turn_index") or -1) >= 0 and str(record.get("role") or "").lower() == "assistant"
+
+
+def _mechanical_rule_for_error_type(error_type: str) -> str:
+    rules = {
+        "thought_exposed": "Assistant responses must not expose hidden reasoning or thought-channel markers.",
+        "empty_assistant_response": "Assistant turns must contain a user-visible response or a valid tool call.",
+        "malformed_tool_call": "Assistant tool calls must be syntactically well-formed with valid JSON arguments.",
+        "internal_marker_leak": "Assistant responses must not expose backend/internal protocol markers.",
+        "invalid_json": "Scan inputs must be valid JSON or a conservatively repairable JSON-like export.",
+        "wrong_turn_role": "Conversation turns must use one of the supported roles: system, user, assistant, or tool.",
+        "truncated_internal_output": "Assistant responses must not expose truncated backend/internal output.",
+    }
+    return rules.get(error_type, "Low-false-positive mechanical transcript-shape rule.")
+
+
+def _single_line(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def bad_case_id(record: dict[str, Any]) -> str:
@@ -3956,6 +4388,243 @@ def render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
             f"status={item.get('status')}；residual={item.get('residual_badcase_count', 0)}"
         )
     return "\n".join(lines)
+
+
+def build_batch_conclusion_sections(conclusion: dict[str, Any]) -> dict[str, Any]:
+    """Build a stable three-part conclusion payload."""
+    approved = int(conclusion.get("approved_case_count") or 0)
+    applied = int(conclusion.get("applied_case_count") or 0)
+    fixed = int(conclusion.get("fixed_case_count") or 0)
+    residual = int(conclusion.get("residual_badcase_count") or 0)
+    unsupported = int(conclusion.get("unsupported_case_count") or 0)
+    failures = int(conclusion.get("verification_failure_count") or 0)
+    file_evidence = [_batch_file_conclusion_evidence(item) for item in conclusion.get("files") or []]
+
+    fixed_turns, residual_turns = _fixed_conclusion_turns(conclusion)
+    if residual == 0 and failures == 0 and unsupported == 0 and fixed == approved:
+        verdict_status = "verified fixed"
+    elif fixed > 0:
+        verdict_status = "partially fixed"
+    elif applied < approved or unsupported:
+        verdict_status = "verification incomplete"
+    else:
+        verdict_status = "not fixed"
+
+    verification_verdict = (
+        f"Status: {verdict_status}.\n"
+        f"Counts: approved={approved}, applied={applied}, fixed={fixed}, "
+        f"residual={residual}, unsupported={unsupported}, verification_failures={failures}.\n"
+        f"Verified turns: {fixed_turns}.\n"
+        f"Residual turns: {residual_turns}.\n"
+        "Correctness basis: residual scan results and observable target-turn behavior. "
+        "Prompt edits, rerun completion, backend metadata, and logprobs are execution evidence, "
+        "not correctness proof."
+    )
+
+    diagnosis = (
+        "Root cause analysis\n"
+        + "\n".join(_fixed_root_cause_lines(conclusion, file_evidence))
+        + "\n\nEvidence data (surface)\n"
+        + "\n".join(_fixed_surface_evidence_lines(conclusion, file_evidence, fixed_turns, residual_turns))
+        + "\n\nEvidence data (deep)\n"
+        + "\n".join(_fixed_deep_evidence_lines(conclusion, file_evidence))
+    )
+
+    return {
+        "verdict_status": verdict_status,
+        "verification_verdict": verification_verdict,
+        "badcase_diagnosis_and_backend_evidence": diagnosis,
+        "next_action": _build_human_next_action(conclusion, fixed, residual, unsupported, failures),
+        "evidence": file_evidence,
+    }
+
+
+def render_apply_conclusion_markdown(conclusion: dict[str, Any]) -> str:
+    sections = conclusion.get("conclusion_sections") or build_batch_conclusion_sections(conclusion)
+    lines = [
+        f"# Apply conclusion: {conclusion['batch_id']}",
+        "",
+        "## 1. Verification verdict",
+        "",
+        str(sections["verification_verdict"]),
+        "",
+        "## 2. Badcase diagnosis and backend evidence",
+        "",
+        str(sections["badcase_diagnosis_and_backend_evidence"]),
+        "",
+        "## 3. Next action",
+        "",
+        str(sections["next_action"]),
+        "",
+        "## Appendix: technical trace summary",
+    ]
+    for item in conclusion.get("files") or []:
+        file_name = Path(str(item.get("source_file") or "unknown")).name
+        request_ids = []
+        for detail in item.get("rerun_results") or []:
+            if not isinstance(detail, dict):
+                continue
+            diagnostics = detail.get("response_diagnostics")
+            if isinstance(diagnostics, dict) and diagnostics.get("request_id"):
+                request_ids.append(str(diagnostics.get("request_id")))
+            elif detail.get("request_id"):
+                request_ids.append(str(detail.get("request_id")))
+        lines.append(
+            f"- `{file_name}`: scan/apply/residual rounds="
+            f"{item.get('scan_event_id')} / {item.get('apply_event_id')} / {item.get('residual_scan_event_id')}; "
+            f"request_ids={', '.join(request_ids) or 'none'}; "
+            f"status={item.get('status')}; residual={item.get('residual_badcase_count', 0)}"
+        )
+    return "\n".join(lines)
+
+
+def _fixed_conclusion_turns(conclusion: dict[str, Any]) -> tuple[list[int], list[int]]:
+    fixed_turns = sorted(
+        {
+            int(case.get("turn_index"))
+            for item in conclusion.get("files") or []
+            for case in item.get("applied_cases") or []
+            if case.get("turn_index") is not None
+            and not any(
+                failure.get("case_id") == case.get("id")
+                for failure in item.get("verification_failures") or []
+            )
+        }
+    )
+    residual_turns = sorted(
+        {
+            int(case.get("turn_index"))
+            for item in conclusion.get("files") or []
+            for case in item.get("residual_badcases") or []
+            if case.get("turn_index") is not None
+        }
+    )
+    return fixed_turns, residual_turns
+
+
+def _fixed_root_cause_lines(conclusion: dict[str, Any], file_evidence: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for item, evidence in zip(conclusion.get("files") or [], file_evidence):
+        file_name = Path(str(item.get("source_file") or "unknown")).name
+        residual_count = int(item.get("residual_badcase_count") or 0)
+        failures = [failure for failure in item.get("verification_failures") or [] if isinstance(failure, dict)]
+        error_types = sorted(
+            {
+                str(failure.get("error_type") or "unknown")
+                for failure in failures
+                if failure.get("error_type")
+            }
+        )
+        if not error_types:
+            error_types = sorted(
+                {
+                    str(case.get("error_type") or "unknown")
+                    for case in item.get("residual_badcases") or []
+                    if isinstance(case, dict) and case.get("error_type")
+                }
+            )
+        if residual_count or failures:
+            lines.append(
+                f"- `{file_name}` is not verified fixed. Likely cause: the target branch/action is still "
+                f"under-constrained for {', '.join(error_types) or 'the residual rule'}."
+            )
+        elif int(item.get("applied_case_count") or 0):
+            lines.append(
+                f"- `{file_name}` is verified fixed because the target behavior no longer appears in the "
+                "post-apply residual scan."
+            )
+        elif evidence.get("is_audit_only"):
+            lines.append(f"- `{file_name}` is audit-only; no approved target case was applied.")
+    if not lines:
+        lines.append("- No file-level conclusion evidence was recorded.")
+    return lines
+
+
+def _fixed_surface_evidence_lines(
+    conclusion: dict[str, Any],
+    file_evidence: list[dict[str, Any]],
+    fixed_turns: list[int],
+    residual_turns: list[int],
+) -> list[str]:
+    lines = [
+        f"- Batch: {conclusion.get('batch_id') or 'unknown'}.",
+        f"- Counts: approved={int(conclusion.get('approved_case_count') or 0)}, "
+        f"applied={int(conclusion.get('applied_case_count') or 0)}, "
+        f"fixed={int(conclusion.get('fixed_case_count') or 0)}, "
+        f"residual={int(conclusion.get('residual_badcase_count') or 0)}, "
+        f"unsupported={int(conclusion.get('unsupported_case_count') or 0)}, "
+        f"verification_failures={int(conclusion.get('verification_failure_count') or 0)}.",
+        f"- Verified turns: {fixed_turns}; residual turns: {residual_turns}.",
+    ]
+    for item, evidence in zip(conclusion.get("files") or [], file_evidence):
+        file_name = Path(str(item.get("source_file") or "unknown")).name
+        comparisons = []
+        for detail in (evidence.get("rerun_details") or [])[:3]:
+            if not isinstance(detail, dict):
+                continue
+            turn = detail.get("turn")
+            old_response = _truncate_conclusion_text(str(detail.get("old_response") or ""), 120)
+            new_response = _truncate_conclusion_text(str(detail.get("new_response") or ""), 120)
+            if turn is not None:
+                comparisons.append(f"turn {turn}: old=`{old_response}` new=`{new_response}`")
+        lines.append(
+            f"- `{file_name}`: applied={int(item.get('applied_case_count') or 0)}, "
+            f"fixed={int(item.get('fixed_case_count') or 0)}, "
+            f"residual={int(item.get('residual_badcase_count') or 0)}, "
+            f"old/new={'; '.join(comparisons) or 'no target rerun comparison recorded'}."
+        )
+    return lines
+
+
+def _fixed_deep_evidence_lines(conclusion: dict[str, Any], file_evidence: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "- Logprob boundary: logprobs can explain confidence or routing tendency only; they cannot prove correctness.",
+    ]
+    for item, evidence in zip(conclusion.get("files") or [], file_evidence):
+        file_name = Path(str(item.get("source_file") or "unknown")).name
+        source_meta_summary = _conclusion_source_meta_summary(item.get("source_meta"))
+        request_ids = [
+            str(detail.get("request_id"))
+            for detail in evidence.get("rerun_details") or []
+            if isinstance(detail, dict) and detail.get("request_id")
+        ]
+        lines.append(
+            f"- `{file_name}`: scan_event_id={item.get('scan_event_id')}, "
+            f"apply_event_id={item.get('apply_event_id')}, "
+            f"residual_scan_event_id={item.get('residual_scan_event_id')}, "
+            f"backend={item.get('apply_provider') or 'unknown'}, model={item.get('apply_model') or 'unknown'}, "
+            f"prompt_hash={item.get('before_hash') or '-'}->{item.get('after_hash') or '-'}, "
+            f"request_ids={request_ids or []}, rerun_targets={item.get('rerun_target_turns') or []}, "
+            f"rerun_errors={item.get('rerun_errors') or []}, "
+            f"source_meta={source_meta_summary}, "
+            f"logprobs={evidence.get('logprob_summary') or 'unavailable'}."
+        )
+    return lines
+
+
+def _conclusion_source_meta_summary(source_meta: Any) -> str:
+    if not isinstance(source_meta, dict) or not source_meta:
+        return "unavailable"
+    kwargs = source_meta.get("kwargs") if isinstance(source_meta.get("kwargs"), dict) else {}
+    nested_meta = source_meta.get("meta") if isinstance(source_meta.get("meta"), dict) else {}
+    nested_kwargs = nested_meta.get("kwargs") if isinstance(nested_meta.get("kwargs"), dict) else {}
+    model_info = source_meta.get("model_info") if isinstance(source_meta.get("model_info"), dict) else {}
+    parts = []
+    for label, value in (
+        ("keys", sorted(str(key) for key in source_meta.keys())),
+        ("type", source_meta.get("type")),
+        ("provider", source_meta.get("provider") or kwargs.get("provider") or nested_kwargs.get("provider")),
+        ("model", source_meta.get("model") or kwargs.get("model") or nested_kwargs.get("model")),
+        ("url", source_meta.get("url") or kwargs.get("url") or nested_kwargs.get("url")),
+        ("model_info_provider", model_info.get("provider")),
+        ("model_info_model", model_info.get("model") or model_info.get("name")),
+    ):
+        if value:
+            parts.append(f"{label}={value}")
+    if not parts:
+        compact = json.dumps(source_meta, ensure_ascii=False, sort_keys=True, default=str)
+        return _truncate_conclusion_text(compact, 400)
+    return _truncate_conclusion_text("; ".join(parts), 400)
 
 
 def new_batch_id(prefix: str) -> str:

@@ -1,6 +1,6 @@
 ---
 name: prompt-compliance-optimizer
-description: Operate, debug, or explain this repository's Prompt Optimizer Agent and strict system-prompt-compliance workflow. Use only when the user explicitly asks to inspect prompt-compliance badcases, generate or review Trace List items, approve/apply prompt fixes, rerun target conversation turns, run batch scan/apply workflows, analyze Updated Conversation or Conclusion behavior, inspect optimization rounds, or troubleshoot the prompt_optimizer_agent app.
+description: Run stage-gated prompt-compliance benchmark analysis, controlled experiments, and approved repair workflows. Use when the user explicitly asks to diagnose a known model response in JSON/JSONL, compare run/checkpoint outputs and meta/logprobs, explain a wrong or terminal branch, generate a Markdown badcase report, separately test suspected causes one variable at a time, generate or review Trace List items, approve/apply prompt fixes, rerun target turns, run batch scan/apply workflows, analyze Updated Conversation or Conclusion behavior, inspect optimization rounds, or troubleshoot the prompt_optimizer_agent app. Execute only the requested stage and never advance automatically.
 ---
 
 # Prompt Compliance Optimizer
@@ -11,11 +11,41 @@ Use the current repository root. If invoked elsewhere, locate the repo containin
 
 Read only the reference needed for the task:
 
+- Read [references/badcase-analysis.md](references/badcase-analysis.md) before Stage 1 analysis of a known benchmark badcase, candidate comparison, meta/logprob interpretation, unexpected conversation ending, or analysis-report creation.
+- Read [references/controlled-experiments.md](references/controlled-experiments.md) only before Stage 2 controlled experiments. Use the bundled concurrent runner for repeated or multi-case experiments.
 - Read [references/repair-plan.md](references/repair-plan.md) before applying approved badcases.
 - Read [references/batch-mode.md](references/batch-mode.md) for multiple JSON files or a folder.
 - Read [references/debug-checklist.md](references/debug-checklist.md) when debugging UI state, reruns, prompt versions, or conclusions.
 - Read [references/conclusion-analysis.md](references/conclusion-analysis.md) before producing or debugging an Apply conclusion.
 - Read [TRIGGERING.md](TRIGGERING.md) only when the user asks how to invoke this skill.
+
+## Mode Selection
+
+- **Stage 1 — Analyze**: use when the user asks why a known response is a badcase, requests a conclusion, or asks for model/meta comparison. Analyze using [references/badcase-analysis.md](references/badcase-analysis.md), always write the Markdown analysis report, link it, and stop. Do not call a model, edit a prompt, or run an experiment.
+- **Stage 2 — Experiment**: use only when the user explicitly asks to test, experiment, control variables, or rerun hypotheses. Read the Stage 1 report or reconstruct its hypotheses, then use [references/controlled-experiments.md](references/controlled-experiments.md). Always write a separate Markdown experiment report and stop. Do not Apply a winning variant.
+- **Scan/review**: use when the user asks to discover candidate badcases. Follow the Core Workflow through the human review gate and stop.
+- **Stage 3 — Apply/repair and verify**: use only after explicit approval of listed cases or an explicitly selected experimental variant. Follow the full Core Workflow and Required Conclusion.
+- **Debug**: use the relevant debug reference and inspect repository state without broadening into scan or repair unless requested.
+
+## Stage Gates
+
+- Execute exactly one stage unless the user explicitly requests multiple named stages in the same message.
+- Treat `analyze`, `diagnose`, `why`, `give me the conclusion`, and equivalent wording as Stage 1 only.
+- Treat `run the experiment`, `test the causes`, `control variables`, `rerun`, and equivalent wording as Stage 2 only.
+- Treat `apply`, `use this variant`, `fix`, `approve`, and equivalent wording as Stage 3 only, subject to existing approval gates.
+- A completed Stage 1 authorizes no Stage 2 calls. A completed Stage 2 authorizes no Stage 3 mutation.
+- End the turn at the requested stage boundary. State the completed stage in the report and final response.
+
+## Automatic Stage Reports
+
+- Always create a Markdown artifact for Stage 1 and Stage 2, even when the user does not separately ask for a file.
+- If the user specifies a folder, use it. Otherwise, for a local JSON/JSONL source, create or reuse a sibling `badcase分析报告` directory.
+- Use stable filenames derived from case id, turn, target model slug, and stage: `<case_id>_turn_<n>_<model>_analysis.md` and `<case_id>_turn_<n>_<model>_experiment.md`.
+- Sanitize filename characters without changing the identifiers written inside the report.
+- Overwrite the same stable stage report on a repeated run; do not create timestamped duplicates.
+- Verify the report exists and return a clickable link. Keep the chat response concise because the Markdown report is the complete deliverable.
+- Render Stage 2 reports from [assets/stage2-experiment-report-template.md](assets/stage2-experiment-report-template.md). A fully completed run must use every template section. A partial or blocked run must still write the same stable report, include every completed experiment, and add the exact errors, skipped experiments, and blockers; never suppress the report because the run was incomplete.
+- For Stage 1 analysis of multiple JSONL records, multiple files, or a folder, render one compact aggregate report from [assets/stage1-multi-case-analysis-template.md](assets/stage1-multi-case-analysis-template.md). Analyze every case separately, but restrict each case to exactly three parts: `分析对象、正确流程和实际对比`, `原因分析`, and `最终归因`. Omit experiment suggestions and test plans.
 
 ## Core Workflow
 
@@ -43,6 +73,12 @@ streamlit run app.py
 - Do not rewrite a prompt merely because an answer could be improved.
 - Treat the residual scan as the source of truth. Say `applied changes`, not `fixed`, when violations remain.
 - Do not fabricate missing ground truth, tool results, dates, amounts, hotline text, or business decisions.
+- For standalone analysis, distinguish a wrong business-terminal branch from technical generation termination. Do not call a response "truncated" or "EOS-stopped" without supporting meta.
+- Treat exact reproduction of the wrong prompt template as branch-selection evidence, not hallucination evidence.
+- Distinguish model-visible conversation content from evaluation-only metadata such as LAEP remarks, judge annotations, and root meta unless the harness demonstrably injects them.
+- Stage 1 reports end with testable hypotheses and no speculative improvement recommendations. Do not test them until Stage 2 is explicitly requested.
+- In Stage 2, test supported hypotheses when the target backend/checkpoint is callable; otherwise report the exact experimental blocker and leave the hypothesis unverified.
+- Never present an experimental prompt variant as an applied or production fix. Applying a winning variant still requires the normal approval and repair workflow.
 
 ## Deterministic Check Generalization
 
@@ -117,6 +153,8 @@ For batch conclusions, use the expanded requirements in [references/batch-mode.m
 - Stop when the user says `stop skill`, `stop using the skill`, or equivalent.
 - Resume only when the user explicitly mentions `$prompt-compliance-optimizer`, links the skill, or asks to resume it.
 - Stop after candidate review output.
+- Stop after Stage 1 analysis report creation. Do not run baseline or variant experiments.
+- Stop after Stage 2 experiment report creation. Do not Apply the winning variant.
 - Stop after an Apply cycle is verified, recorded, and concluded.
 - Run no fresh scan unless the user explicitly asks. Apply verification permits exactly one post-apply residual scan. A user approval such as `continue`, `apply residual`, or `use the next step` after a residual conclusion authorizes one residual-continuation cycle.
 - If no valid badcase exists, report that no fix is needed and stop.
@@ -128,6 +166,7 @@ For batch conclusions, use the expanded requirements in [references/batch-mode.m
 - `prompt_optimizer_agent/agent_logic.py`: judge, prompt edit, targeted rerun, required-tool forcing, conclusion payload.
 - `prompt_optimizer_agent/json_utils.py`: JSON and tool-call wrapper parsing.
 - `tools/batch_prompt_compliance.py`: batch scan/apply CLI.
+- `scripts/run_stage2_experiments.py`: baseline-gated concurrent Stage 2 runner with resume state and stable partial/full Markdown reports.
 - `logs/optimization_rounds.jsonl`: scan/apply/residual-scan history.
 - `logs/company_api_requests.jsonl`: outgoing request audit.
 - `logs/company_api_preflight_system_prompt.log`: preflight prompt hash and targeted rerun request.

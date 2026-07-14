@@ -1,6 +1,27 @@
 # Triggering Examples
 
-Use this skill only for explicit Prompt Optimizer Agent or strict system-prompt-compliance work.
+Use this skill only for explicit Prompt Optimizer Agent, benchmark badcase diagnosis, or strict system-prompt-compliance work.
+
+## Analyze A Known Benchmark Badcase
+
+```text
+$prompt-compliance-optimizer
+
+Analyze the target model's final response in <benchmark.jsonl>. Reconstruct the active workflow state,
+compare the candidate models and judge results, interpret relevant meta/logprobs, determine whether the
+conversation ended through a wrong business branch or technical termination, write the Markdown analysis
+report, and stop without running experiments.
+```
+
+## Run Controlled Experiments Separately
+
+```text
+$prompt-compliance-optimizer
+
+Using the Stage 1 report for <benchmark.jsonl> turn <n> model <checkpoint>, run Stage 2 only.
+Test each cause with isolated single-variable target-turn reruns, write the separate Markdown experiment
+report, and stop without applying any variant.
+```
 
 ## Inspect And Stop For Review
 
@@ -49,4 +70,4 @@ Batch scan all conversation JSON files in <folder>. Produce the review JSON
 and Markdown report, summarize candidates by file, then stop for approval.
 ```
 
-Natural-language requests that explicitly mention Prompt Optimizer Agent, prompt-compliance badcases, Trace List, targeted rerun, Updated Conversation, batch scan/apply, or optimization-round conclusions may also trigger the skill.
+Natural-language requests that explicitly mention benchmark or prompt-compliance badcase analysis, candidate model/run/checkpoint comparison, unexpected terminal responses, controlled experiments, Prompt Optimizer Agent, Trace List, targeted rerun, Updated Conversation, batch scan/apply, or optimization-round conclusions may also trigger the skill. Execute only the requested stage.

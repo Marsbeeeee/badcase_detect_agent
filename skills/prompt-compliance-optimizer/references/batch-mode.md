@@ -2,6 +2,20 @@
 
 Use Batch Mode only when the user explicitly provides multiple JSON files or a folder.
 
+## Multi-Case Stage 1 Analysis
+
+When the user already identifies the target badcase response/model and asks to analyze multiple JSONL records, treat the task as Stage 1 analysis rather than candidate discovery. Parse every record, inspect its visible conversation state, target candidate, comparison candidates, judge/human evidence, and meta/logprobs, then write one stable aggregate Markdown report using `assets/stage1-multi-case-analysis-template.md`.
+
+Use `<input-stem>_multi_case_analysis.md` for one multi-record JSONL file. Use `multi_case_badcase_analysis.md` for an explicit file list or folder unless the user specifies a name. Overwrite the same stable report on repeat runs.
+
+Each case must contain only:
+
+1. analysis object, correct flow, and actual comparison;
+2. concise cause analysis, with each cause limited to two or three sentences and Meta expressed as causal evidence;
+3. final attribution in one or two sentences plus compact labels.
+
+Do not append experiment suggestions, improvement recommendations, or testable experiment plans. Record parsing failures, absent target candidates, and insufficient evidence in the report instead of dropping cases. Stop after linking the Stage 1 report.
+
 ## Scan
 
 1. Run `tools/batch_prompt_compliance.py scan <file-or-folder> ...`.

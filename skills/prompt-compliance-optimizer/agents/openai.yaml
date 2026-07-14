@@ -1,4 +1,4 @@
 interface:
   display_name: "Prompt Compliance Optimizer"
-  short_description: "Run prompt-compliance badcase workflows"
-  default_prompt: "Use $prompt-compliance-optimizer to inspect a prompt-compliance badcase, run batch workflows, or rerun the target turn."
+  short_description: "Stage-gated analysis and efficient experiments"
+  default_prompt: "Use $prompt-compliance-optimizer to analyze a benchmark badcase or run baseline-gated controlled experiments and write stable Markdown reports."

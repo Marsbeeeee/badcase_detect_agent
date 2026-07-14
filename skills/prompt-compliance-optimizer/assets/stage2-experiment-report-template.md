@@ -1,0 +1,29 @@
+# {{TITLE}}
+
+## 实验对象
+
+{{EXPERIMENT_OBJECT}}
+
+## 结论
+
+{{CONCLUSION}}
+
+## 实验控制
+
+{{EXPERIMENT_CONTROLS}}
+
+## 结果汇总
+
+{{RESULT_TABLE}}
+
+{{EXPERIMENT_SECTIONS}}
+
+{{BLOCKER_SECTION}}
+
+## 执行等价性限制
+
+{{EQUIVALENCE_LIMITS}}
+
+## 实验结论
+
+{{EXPERIMENT_CONCLUSION}}

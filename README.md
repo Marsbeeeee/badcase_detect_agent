@@ -44,34 +44,84 @@ Install the development dependencies before running tests:
 .\.venv312\Scripts\python.exe -m pytest tests -q
 ```
 
-## Codex Skill Sync
+## Share And Install The Codex Skill With GitHub
 
-这个仓库同时保存 Codex skill 源文件：
+这个仓库同时保存应用代码和 Codex skill 源文件：
 
 ```text
 skills/prompt-compliance-optimizer/
 ```
 
-在新电脑或更新后，把仓库内 skill 同步到 Codex 的 skill 目录：
+该 skill 会调用本仓库的 `app.py`、`prompt_optimizer_agent/` 和 `tools/`，因此使用者需要克隆完整仓库，不能只复制 `SKILL.md`。
+
+### Install From GitHub
+
+先克隆仓库：
 
 ```bash
-cd /path/to/prompt_optimizer_agent
+git clone https://github.com/Marsbeeeee/badcase_detect_agent.git
+cd badcase_detect_agent
+```
+
+再把 skill 安装到 Codex。macOS / Linux：
+
+```bash
 mkdir -p ~/.codex/skills/prompt-compliance-optimizer
 rsync -a --delete skills/prompt-compliance-optimizer/ ~/.codex/skills/prompt-compliance-optimizer/
 ```
 
-之后在 Codex 里可以这样调用：
+Windows PowerShell：
+
+```powershell
+$dest = Join-Path $HOME ".codex\skills\prompt-compliance-optimizer"
+New-Item -ItemType Directory -Force $dest | Out-Null
+Copy-Item "skills\prompt-compliance-optimizer\*" $dest -Recurse -Force
+```
+
+也可以使用 Codex 自带的 GitHub skill installer（公开仓库可直接下载；私有仓库需要已有 Git 凭据或 `GITHUB_TOKEN` / `GH_TOKEN`）：
+
+```bash
+python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
+  --repo Marsbeeeee/badcase_detect_agent \
+  --path skills/prompt-compliance-optimizer
+```
+
+安装后，在 Codex 的下一轮对话中调用：
 
 ```text
 $prompt-compliance-optimizer 批量找这些 JSON 里的 badcase
 ```
 
-每次这个仓库更新后，在另一台电脑执行：
+仓库更新后，先执行 `git pull`，再重新同步 skill 目录。GitHub installer 不会覆盖已存在的 skill；更新时应删除旧安装目录后重装，或使用上面的 `rsync` / `Copy-Item` 命令。
+
+### Data Safety Before Push
+
+所有真实输入、benchmark 数据、运行日志、模型请求记录和生成报告都只能保留在本地。仓库默认忽略：
+
+```text
+data/
+logs/
+outputs/
+.env*
+.streamlit/secrets.toml
+```
+
+`examples/sample_conversation.json` 是唯一有意提交的演示数据；只能放脱敏、可公开的内容。推送前检查：
 
 ```bash
-git pull
-rsync -a --delete skills/prompt-compliance-optimizer/ ~/.codex/skills/prompt-compliance-optimizer/
+git status --short
+git ls-files data logs outputs
 ```
+
+第二条命令应无输出。如果某个运行数据文件曾经被 Git 跟踪，仅添加 `.gitignore` 不会自动取消跟踪；先执行：
+
+```bash
+git rm -r --cached --ignore-unmatch data logs outputs
+```
+
+这只会从 Git 索引移除文件，不会删除本地数据。然后再检查 staged diff，确认没有真实对话、提示词、API 请求、日志或报告后才可 push。
+
+> **公开仓库前注意：** `.gitignore` 只保护未来提交。若 `data/`、`logs/` 或 `outputs/` 曾经被 push，它们仍可从 Git 历史读取。公开或分享仓库前，应由仓库管理员使用 `git filter-repo` 等工具清除所有分支和 tag 中的这些路径，再强制更新远端；所有协作者随后需要重新 clone。任何曾出现在日志里的 API key、token 或内部凭据都必须轮换。历史重写会影响所有协作者，不要在未协调时执行。
 
 如果使用 OpenAI：
 

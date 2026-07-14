@@ -1486,15 +1486,20 @@ def can_rerun_unchanged_prompt(
     target_indices: set[int],
     required_tools_by_turn: dict[int, str],
 ) -> bool:
-    return bool(target_indices and required_tools_by_turn)
+    return bool(target_indices)
 
 
 def unchanged_prompt_rerun_summary(target_count: int) -> str:
     turn_word = "turn" if target_count == 1 else "turns"
     return (
-        "No new system-prompt version was needed; the existing prompt already contains the required "
-        f"tool rule, so this run only regenerated the target assistant {turn_word} with the current prompt."
+        "No new system-prompt version was needed; this run only regenerated the target assistant "
+        f"{turn_word} with the current prompt."
     )
+
+
+def prompt_edit_backend_rejected(rationale: str) -> bool:
+    lowered = str(rationale or "").lower()
+    return "llm prompt edit rejected" in lowered or "llm prompt edit failed" in lowered
 
 
 def prompt_fingerprint(prompt: str) -> str:
@@ -1536,8 +1541,12 @@ def retry_prompt_edit_if_unchanged(
     bad_case: BadCase,
     llm_settings: LLMSettings,
     optimization: PromptOptimization,
+    *,
+    allow_conversation_only: bool = False,
 ) -> tuple[PromptOptimization, int]:
     if optimization.optimized_prompt != current_prompt:
+        return optimization, 0
+    if allow_conversation_only and not prompt_edit_backend_rejected(optimization.rationale):
         return optimization, 0
     retry_case = BadCase(
         turn_index=bad_case.turn_index,
@@ -1678,6 +1687,8 @@ def apply_bad_case_to_prompt(
     case = st.session_state.bad_cases[case_index]
     parent_scan_round_id = st.session_state.get("latest_scan_round_id")
     before_version = current_prompt_version_label()
+    target_indices = rerun_targets_for_cases(data, [case])
+    required_tools_by_turn = required_tools_for_cases(data, [case])
     optimization = apply_recommendation_to_system_prompt(
         data=data,
         current_system_prompt=current_prompt,
@@ -1690,6 +1701,7 @@ def apply_bad_case_to_prompt(
         bad_case=case,
         llm_settings=llm_settings,
         optimization=optimization,
+        allow_conversation_only=bool(target_indices),
     )
     st.session_state.optimization = optimization
     st.session_state.pending_current_system_prompt_view = optimization.optimized_prompt
@@ -1704,8 +1716,6 @@ def apply_bad_case_to_prompt(
         "Before Apply",
         "After Apply",
     )
-    target_indices = rerun_targets_for_cases(data, [case])
-    required_tools_by_turn = required_tools_for_cases(data, [case])
     rerun_attempted = False
     if optimization.optimized_prompt != current_prompt:
         sync_loaded_system_prompt(optimization.optimized_prompt)
@@ -1729,7 +1739,10 @@ def apply_bad_case_to_prompt(
         )
         rerun_attempted = True
         set_apply_status_from_rerun("Applied and rerun.")
-    elif can_rerun_unchanged_prompt(target_indices, required_tools_by_turn):
+    elif (
+        can_rerun_unchanged_prompt(target_indices, required_tools_by_turn)
+        and not prompt_edit_backend_rejected(optimization.rationale)
+    ):
         rerun_only_summary = unchanged_prompt_rerun_summary(len(target_indices))
         st.session_state.last_apply_summary = rerun_only_summary
         push_toast("No new prompt version; rerunning target turn.", "info")
@@ -1798,6 +1811,8 @@ def apply_selected_bad_cases_to_prompt(
     applied_summaries = []
     last_optimization = None
     retry_count = 0
+    target_indices = rerun_targets_for_cases(data, selected_cases)
+    required_tools_by_turn = required_tools_for_cases(data, selected_cases)
     for case in selected_cases:
         optimization = apply_recommendation_to_system_prompt(
             data=data,
@@ -1811,6 +1826,7 @@ def apply_selected_bad_cases_to_prompt(
             bad_case=case,
             llm_settings=llm_settings,
             optimization=optimization,
+            allow_conversation_only=bool(rerun_targets_for_cases(data, [case])),
         )
         retry_count += case_retry_count
         last_optimization = optimization
@@ -1833,8 +1849,6 @@ def apply_selected_bad_cases_to_prompt(
         "Before Apply Selected",
         "After Apply Selected",
     )
-    target_indices = rerun_targets_for_cases(data, selected_cases)
-    required_tools_by_turn = required_tools_for_cases(data, selected_cases)
     rerun_attempted = False
     if working_prompt != before_prompt:
         sync_loaded_system_prompt(working_prompt)
@@ -1858,7 +1872,10 @@ def apply_selected_bad_cases_to_prompt(
         )
         rerun_attempted = True
         set_apply_status_from_rerun("Applied and rerun.")
-    elif can_rerun_unchanged_prompt(target_indices, required_tools_by_turn):
+    elif (
+        can_rerun_unchanged_prompt(target_indices, required_tools_by_turn)
+        and not prompt_edit_backend_rejected(last_optimization.rationale if last_optimization else "")
+    ):
         rerun_only_summary = unchanged_prompt_rerun_summary(len(target_indices))
         st.session_state.last_apply_summary = rerun_only_summary
         push_toast("No new prompt version; rerunning selected target turn(s).", "info")

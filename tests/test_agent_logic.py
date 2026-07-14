@@ -174,6 +174,27 @@ def test_local_scan_flags_exposed_thought_marker() -> None:
     assert "`<thought>`" in cases[0].evidence
 
 
+def test_local_scan_flags_malformed_exposed_thought_marker() -> None:
+    data = ConversationData(
+        system_prompt="Only provide the final answer to the user.",
+        interactions=[
+            Interaction(role="user", content="Can you help?"),
+            Interaction(role="assistant", content="<thought\nThinking Process:\n1. private reasoning"),
+        ],
+    )
+
+    cases = [
+        case
+        for case in _local_prompt_rule_bad_cases(data)
+        if case.error_type == "thought_exposed"
+    ]
+
+    assert len(cases) == 1
+    assert cases[0].turn_index == 1
+    assert cases[0].source == "mechanical_detector"
+    assert "`<thought`" in cases[0].evidence
+
+
 def test_local_scan_ignores_user_quoted_thought_marker() -> None:
     data = ConversationData(
         system_prompt="Only provide the final answer to the user.",

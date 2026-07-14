@@ -15,7 +15,9 @@ __pycache__/
 .tmp_uv/
 .uv_cache/
 
-# Runtime output and build artifacts
+# Runtime inputs, outputs, logs, and build artifacts
+# Never commit real conversations, benchmark runs, reports, or model traces.
+data/
 logs/
 outputs/
 dist/
@@ -31,3 +33,4 @@ llmparty/llmparty/
 # Editor and OS files
 .DS_Store
 .vscode/
+.streamlit/secrets.toml

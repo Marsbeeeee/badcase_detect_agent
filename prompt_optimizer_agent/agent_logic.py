@@ -453,6 +453,8 @@ def _exposed_thought_marker(content: str) -> str | None:
             return f"<{marker}>"
         if re.search(rf"<\s*{marker}\s*>", text, flags=re.IGNORECASE):
             return f"<{marker}>"
+        if re.search(rf"<\s*{marker}(?=\s|$)", text, flags=re.IGNORECASE):
+            return f"<{marker}"
     return None
 
 
@@ -2155,9 +2157,12 @@ def generate_experiment_conclusion(
         "not improve. Use token/logprob evidence only when token_probability.available is true. If it is false, say "
         "that token logprobs were requested but are unavailable, empty, unsupported, or missing according to "
         "token_probability.reasons, so token-probability analysis cannot be performed. Then use behavior/meta/tool "
-        "evidence instead. Treat diagnostic_evidence.response_metadata as backend execution metadata, not "
-        "token-confidence evidence. High-confidence logprobs on a wrong response mean the backend strongly preferred "
-        "the wrong behavior; they do not prove compliance.\n\n"
+        "evidence instead. Treat diagnostic_evidence.response_metadata as experiment-condition evidence: use it to "
+        "check whether provider, model, endpoint, request ids, rerun targets, and tool state were consistent enough "
+        "to trust the comparison, not as token-confidence evidence. Treat logprobs as a stability signal only: high "
+        "confidence on a correct rerun can suggest the behavior was not a shaky one-off, while high confidence on a "
+        "wrong rerun suggests stable wrong-branch preference. Low confidence near key tokens suggests weaker rerun "
+        "stability. Logprobs and metadata never prove compliance; residual scan and target behavior do.\n\n"
         "paragraph_3 must give the single best next action for the current verified state using "
         "paragraph_inputs.paragraph_3_next_recommendation. If verification passed, say to keep the version and stop. "
         "If it failed, tie the action to the observed root cause and backend evidence. If repair_saturation says "
@@ -2259,7 +2264,9 @@ def _deterministic_experiment_conclusion(
         else "No new system-prompt version was created; the target turn was rerun with the existing prompt."
     )
     if logprob_available:
-        token_evidence = "Token-probability evidence was available and can be used only as backend confidence context"
+        token_evidence = (
+            "Token logprobs were available and can be used only as a model-confidence and rerun-stability signal"
+        )
     else:
         unavailable_reasons = token_probability.get("reasons") or [token_probability.get("reason")]
         reason_text = "; ".join(str(reason) for reason in unavailable_reasons if reason)
@@ -2270,7 +2277,10 @@ def _deterministic_experiment_conclusion(
             )
         else:
             token_evidence = "Token logprobs are unavailable for analysis"
-    second = f"{prompt_evidence} {token_evidence}; the residual scan is the verification source of truth."
+    second = (
+        f"{prompt_evidence} {token_evidence}; backend metadata is only experiment-condition evidence, "
+        "and the residual scan plus target behavior remain the verification source of truth."
+    )
     third = (
         "The cycle is complete; keep this prompt version and do not run another scan unless requested."
         if residual_count == 0
@@ -2389,7 +2399,9 @@ def _build_conclusion_payload(
                     "If exact_text_changed is true but approximate_similarity is high, say wording changed and judge the behavior.",
                     "Use token probability only when available is true; otherwise say there is no token-probability evidence.",
                     "If token probability is unavailable, mention whether logprobs were requested and cite the unavailable reason.",
-                    "Prefer behavior, tool-call state, metadata, and residual scan evidence over prompt wording alone.",
+                    "Use metadata to check experiment-condition consistency, not correctness.",
+                    "Use logprobs only to discuss whether the rerun looks stable or shaky.",
+                    "Prefer behavior, tool-call state, and residual scan evidence over prompt wording alone.",
                 ],
             },
             "paragraph_3_next_recommendation": {

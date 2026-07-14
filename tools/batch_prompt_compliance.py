@@ -970,6 +970,7 @@ def apply_prompt_cases_with_llm(
             bad_case=bad_case,
             llm_settings=settings,
             optimization=optimization,
+            allow_conversation_only=bool(rerun_targets_for_case_records(case_data, [case])),
         )
         total_prompt_edit_retries += case_retry_count
         prompt_changed = optimization.optimized_prompt != working_prompt
@@ -1093,8 +1094,11 @@ def retry_prompt_edit_if_unchanged_batch(
     bad_case: BadCase,
     llm_settings: LLMSettings,
     optimization: Any,
+    allow_conversation_only: bool = False,
 ) -> tuple[Any, int]:
     if optimization.optimized_prompt != current_prompt:
+        return optimization, 0
+    if allow_conversation_only:
         return optimization, 0
     retry_case = BadCase(
         turn_index=bad_case.turn_index,
@@ -3473,6 +3477,102 @@ def render_review_markdown(review: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_review_markdown(review: dict[str, Any]) -> str:
+    interactions_cache: dict[str, list[Interaction] | None] = {}
+    lines = [
+        f"# Batch Badcase Review: {review['batch_id']}",
+        "",
+        "## Summary",
+        "",
+        (
+            f"Scanned {review['file_count']} file(s) and found "
+            f"{review['badcase_count']} candidate badcase(s). Review the evidence before Apply."
+        ),
+        "",
+    ]
+    for file_record in review.get("files") or []:
+        source_path = str(file_record.get("path") or "")
+        interactions = interactions_cache.get(source_path)
+        if interactions is None and source_path:
+            interactions = _conversation_interactions_from_file(source_path)
+            interactions_cache[source_path] = interactions
+
+        lines.extend(
+            [
+                f"## {file_record.get('file_name')}",
+                "",
+                f"- File path: `{file_record.get('path')}`",
+                f"- Scan round: `{file_record.get('scan_event_id')}`",
+                f"- Status: `{file_record.get('status')}`",
+                f"- Candidate badcases: {file_record.get('badcase_count', 0)}",
+                "",
+            ]
+        )
+        if file_record.get("parse_error"):
+            lines.extend([f"Parse error: {file_record['parse_error']}", ""])
+            continue
+
+        badcases = file_record.get("badcases") or []
+        if not badcases:
+            lines.extend(["No candidate prompt-compliance badcase found.", ""])
+            continue
+
+        for index, case in enumerate(badcases, start=1):
+            source_turn, user_turn, user_text, assistant_text = _resolve_review_case_turn_context(
+                case=case,
+                interactions=interactions,
+            )
+            lines.extend(
+                [
+                    f"### {index}. `{case['id']}`",
+                    "",
+                    "#### Conversation Snippet",
+                ]
+            )
+            if source_turn is None:
+                lines.extend(["- Could not locate the original assistant turn.", ""])
+            else:
+                if user_turn is None:
+                    lines.append("- User turn: not available from the parsed conversation context.")
+                else:
+                    lines.append(f"- User turn {user_turn}: {user_text}")
+                lines.extend([f"- Assistant turn {source_turn}: {assistant_text}", ""])
+
+            lines.extend(
+                [
+                    "#### Evidence",
+                    f"- Violated rule: {case.get('violated_rule') or '-'}",
+                    f"- Assistant violation: {case.get('assistant_violation') or '-'}",
+                    "",
+                    "#### Suggested Action",
+                    f"- {case.get('recommendation') or 'Review and repair this target turn.'}",
+                    "- Rerun or clean only the affected assistant turn when the prompt already contains the relevant rule.",
+                    "- Verify with one residual scan after Apply.",
+                    "",
+                    "#### Raw Metadata",
+                    f"- turn: `{case.get('turn_index')}`",
+                    f"- error_type: `{case.get('error_type')}`",
+                    f"- source: `{case.get('source')}`",
+                    f"- scan round: `{file_record.get('scan_event_id')}`",
+                    "",
+                ]
+            )
+
+    lines.extend(
+        [
+            "## Approval",
+            "",
+            "After review, approve selected case ids or run Apply with `--approve-all`.",
+            "",
+            "```json",
+            json.dumps({"approved_case_ids": []}, indent=2),
+            "```",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _build_fix_comparison_lines(conclusion: dict[str, Any]) -> str:
     lines: list[str] = []
     for item in conclusion.get("files") or []:
@@ -3852,7 +3952,10 @@ def _batch_file_conclusion_evidence(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _summarize_logprobs(rerun_details: list[dict[str, Any]], residual_cases: list[dict[str, Any]]) -> tuple[str, str]:
+def _summarize_logprobs_legacy_mojibake(
+    rerun_details: list[dict[str, Any]],
+    residual_cases: list[dict[str, Any]],
+) -> tuple[str, str]:
     logprob_available = [detail for detail in rerun_details if detail["logprobs_available"]]
     if not logprob_available:
         return (
@@ -3885,6 +3988,44 @@ def _summarize_logprobs(rerun_details: list[dict[str, Any]], residual_cases: lis
     return (
         "；".join(parts) + "。logprobs 只解释后端置信度，正确性仍以 residual scan 为准。",
         "；".join(interpretations),
+    )
+
+
+def _summarize_logprobs(rerun_details: list[dict[str, Any]], residual_cases: list[dict[str, Any]]) -> tuple[str, str]:
+    logprob_available = [detail for detail in rerun_details if detail["logprobs_available"]]
+    if not logprob_available:
+        return (
+            "unavailable; no token-confidence or stability read is supported.",
+            "no available logprob evidence",
+        )
+    residual_turns = {case.get("turn_index") for case in residual_cases}
+    parts = []
+    interpretations = []
+    for detail in logprob_available:
+        avg = detail.get("avg_logprob")
+        minimum = detail.get("min_logprob")
+        turn = detail.get("turn")
+        if turn in residual_turns and isinstance(avg, (int, float)) and avg >= -0.2:
+            interpretation = "stable residual-behavior preference"
+        elif isinstance(minimum, (int, float)) and minimum <= -2.0:
+            interpretation = "local token uncertainty; rerun stability is weaker"
+        else:
+            interpretation = "confidence context only; stability is not proven by one run"
+        interpretations.append(f"turn {turn}: {interpretation}")
+        tokens = ", ".join(
+            str(token.get("token")).strip()
+            for token in detail.get("low_confidence_tokens") or []
+            if token.get("token")
+        ) or "none"
+        parts.append(
+            f"turn {turn} avg_logprob={_format_logprob_value(avg)}, min_logprob={_format_logprob_value(minimum)}, "
+            f"request={detail.get('request_id') or 'none'}, stability_read={interpretation}, low_tokens={tokens}"
+        )
+    return (
+        "; ".join(parts)
+        + ". Logprobs describe model confidence and whether the rerun looks stable or shaky; "
+        "they do not prove the fix. Correctness still comes from target behavior plus residual scan.",
+        "; ".join(interpretations),
     )
 
 
@@ -4578,7 +4719,8 @@ def _fixed_surface_evidence_lines(
 
 def _fixed_deep_evidence_lines(conclusion: dict[str, Any], file_evidence: list[dict[str, Any]]) -> list[str]:
     lines = [
-        "- Logprob boundary: logprobs can explain confidence or routing tendency only; they cannot prove correctness.",
+        "- Evidence boundary: metadata is used to check experiment-condition consistency; logprobs are used to read model confidence and rerun stability. Neither proves correctness.",
+        "- Correctness boundary: the fix verdict comes only from observable target-turn behavior plus the residual scan.",
     ]
     for item, evidence in zip(conclusion.get("files") or [], file_evidence):
         file_name = Path(str(item.get("source_file") or "unknown")).name
@@ -4596,8 +4738,8 @@ def _fixed_deep_evidence_lines(conclusion: dict[str, Any], file_evidence: list[d
             f"prompt_hash={item.get('before_hash') or '-'}->{item.get('after_hash') or '-'}, "
             f"request_ids={request_ids or []}, rerun_targets={item.get('rerun_target_turns') or []}, "
             f"rerun_errors={item.get('rerun_errors') or []}, "
-            f"source_meta={source_meta_summary}, "
-            f"logprobs={evidence.get('logprob_summary') or 'unavailable'}."
+            f"condition_meta={source_meta_summary}, "
+            f"stability_logprobs={evidence.get('logprob_summary') or 'unavailable'}."
         )
     return lines
 

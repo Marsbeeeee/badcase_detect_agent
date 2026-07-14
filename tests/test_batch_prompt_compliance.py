@@ -127,11 +127,13 @@ def test_batch_conclusion_has_three_semantic_parts_with_backend_evidence() -> No
     assert "openai_api_like" in sections["badcase_diagnosis_and_backend_evidence"]
     assert "voyager-test" in sections["badcase_diagnosis_and_backend_evidence"]
     assert "request-1" in sections["badcase_diagnosis_and_backend_evidence"]
-    assert "source_meta=" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "condition_meta=" in sections["badcase_diagnosis_and_backend_evidence"]
     assert "meta-provider" in sections["badcase_diagnosis_and_backend_evidence"]
     assert "meta-model" in sections["badcase_diagnosis_and_backend_evidence"]
-    assert "Logprob boundary: logprobs can explain confidence" in sections["badcase_diagnosis_and_backend_evidence"]
-    assert "they cannot prove correctness" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "metadata is used to check experiment-condition consistency" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "logprobs are used to read model confidence and rerun stability" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "stability_logprobs=" in sections["badcase_diagnosis_and_backend_evidence"]
+    assert "Correctness boundary" in sections["badcase_diagnosis_and_backend_evidence"]
     assert "Turn 9 asked for another date." not in sections["verification_verdict"]
     assert sections["evidence"][0]["rerun_details"][0]["request_id"] == "request-1"
     assert "## 1. Verification verdict" in markdown
@@ -916,7 +918,7 @@ def test_apply_prompt_cases_matches_app_selected_rerun(monkeypatch) -> None:
     assert unsupported == []
 
 
-def test_apply_prompt_cases_retries_unchanged_prompt_like_app(monkeypatch) -> None:
+def test_apply_prompt_cases_reruns_unchanged_prompt_without_forcing_edit(monkeypatch) -> None:
     data = ConversationData(
         system_prompt="Prompt v0",
         interactions=[
@@ -956,9 +958,7 @@ def test_apply_prompt_cases_retries_unchanged_prompt_like_app(monkeypatch) -> No
     def fake_apply_recommendation_to_system_prompt(**kwargs):
         prompts_seen.append(kwargs["bad_case"].recommendation)
         force_flags.append(kwargs.get("force_prompt_edit", False))
-        if len(prompts_seen) == 1:
-            return FakeOptimization(kwargs["current_system_prompt"])
-        return FakeOptimization(kwargs["current_system_prompt"] + " + retry edit")
+        return FakeOptimization(kwargs["current_system_prompt"])
 
     monkeypatch.setattr(
         "tools.batch_prompt_compliance.apply_recommendation_to_system_prompt",
@@ -988,11 +988,13 @@ def test_apply_prompt_cases_retries_unchanged_prompt_like_app(monkeypatch) -> No
         args=args,
     )
 
-    assert "previous apply attempt returned the system prompt unchanged" in prompts_seen[1].lower()
-    assert force_flags == [False, True]
-    assert updated_data.system_prompt == "Prompt v0 + retry edit"
-    assert meta["prompt_edit_retries"] == 1
-    assert applied[0]["prompt_changed"] is True
+    assert prompts_seen == ["go to closing"]
+    assert force_flags == [False]
+    assert updated_data.system_prompt == "Prompt v0"
+    assert updated_data.interactions[1].content == "closing"
+    assert meta["prompt_edit_retries"] == 0
+    assert meta["rerun_attempted"] is True
+    assert applied[0]["prompt_changed"] is False
     assert unsupported == []
 
 

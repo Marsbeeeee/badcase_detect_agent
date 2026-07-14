@@ -9,6 +9,13 @@ Use the existing Prompt Optimizer Agent app and backend as the execution surface
 
 Use the current repository root. If invoked elsewhere, locate the repo containing `app.py`, `prompt_optimizer_agent/`, `tools/`, and `logs/`.
 
+## Maintenance Source of Truth
+
+- Treat `<repository-root>/skills/prompt-compliance-optimizer/` as the only editable source for this skill.
+- Never edit the installed copy under `$CODEX_HOME/skills/prompt-compliance-optimizer/` directly.
+- For every skill update, edit and validate the repository copy, confirm the files appear in `git status`, then mirror that copy one-way to the installed location.
+- Keep generated benchmark data and reports outside the skill directory and outside Git.
+
 Read only the reference needed for the task:
 
 - Read [references/badcase-analysis.md](references/badcase-analysis.md) before Stage 1 analysis of a known benchmark badcase, candidate comparison, meta/logprob interpretation, unexpected conversation ending, or analysis-report creation.

@@ -46,6 +46,8 @@ Install the development dependencies before running tests:
 
 ## Share And Install The Codex Skill With GitHub
 
+完整的接收方安装教程见 [GITHUB_SKILL_INSTALL.md](GITHUB_SKILL_INSTALL.md)。
+
 这个仓库同时保存应用代码和 Codex skill 源文件：
 
 ```text

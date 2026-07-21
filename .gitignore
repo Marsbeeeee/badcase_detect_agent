@@ -28,6 +28,8 @@ build/
 .tmp_*/
 .tmp_*
 *.tmp
+__MACOSX/
+._*
 llmparty/llmparty/
 
 # Editor and OS files

@@ -257,8 +257,18 @@ Then provide per-experiment evidence:
 2. controls held constant;
 3. representative output difference;
 4. judge/rule evidence;
-5. logprob interpretation, if available;
+5. logprob interpretation, if available: align the baseline and variant at the
+   same semantic decision word or phrase, then state whether the desired
+   continuation's confidence or recorded rank increased, whether the wrong
+   continuation's margin narrowed or reversed, and whether the model changed
+   from confident-wrong to uncertain/correct; omit dimensions not supported by
+   the recorded top-k;
 6. classification and confidence limitation.
+
+Add `Logprob 前后变化结论` before `实验结论`. Use natural language and the
+human-readable decision word or phrase. Do not compare unaligned tokenizer
+positions, different models/checkpoints, or materially different decoding
+settings; record the comparison as unavailable instead.
 
 Finish with `实验结论`:
 

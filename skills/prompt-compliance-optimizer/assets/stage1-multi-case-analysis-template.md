@@ -1,83 +1,61 @@
-# 多 Case Badcase 分析报告
+# 多 Case Badcase 分析结论
 
 ## 分析范围
 
 - 输入文件/目录：`{{input_path}}`
-- 总记录数：`{{record_count}}`
-- 成功分析：`{{analyzed_count}}`
-- 解析失败/证据不足：`{{failed_count}}`
-- 目标模型：`{{target_model}}`
+- 总 Case 数：`{{record_count}}`
+- 成功得出结论：`{{analyzed_count}}`
+- 证据不足：`{{failed_count}}`
 - 分析阶段：Stage 1，仅分析，未运行实验，未修改 prompt
 
-## 总体概览
+## 结论总览
 
-| # | Case ID | Turn | Badcase 类型 | 终止类型 | 核心归因 |
-|---:|---|---:|---|---|---|
-| {{case_number}} | `{{case_id}}` | {{target_turn}} | `{{error_type}}` | {{termination_type}} | {{short_cause}} |
-
----
-
-## Case {{case_number}}
-
-### 1. 分析对象、正确流程和实际对比
-
-- Case ID：`{{case_id}}`
-- 数据文件：`{{source_file}}`
-- 目标轮次：`{{target_turn}}`
-- 目标模型：`{{target_model}}`
-- 当前用户输入：
-
-> {{target_user_message}}
-
-正确流程：
-
-> {{correct_route_in_one_or_two_sentences}}
-
-目标模型实际回复：
-
-> {{badcase_response}}
-
-实际偏差：
-
-> {{behavior_difference_in_one_or_two_sentences}}
-
-### 2. 原因分析
-
-#### 原因一：{{primary_cause_name}}
-
-{{primary_cause_in_two_or_three_sentences}}
-
-#### 原因二：{{secondary_cause_name_optional}}
-
-{{secondary_cause_in_two_or_three_sentences_or_omit}}
-
-#### Meta 证据：{{meta_evidence_type}}
-
-{{meta_causal_interpretation_in_two_or_three_sentences}}
-
-### 3. 最终归因
-
-> {{final_attribution_in_one_or_two_sentences}}
-
-- Primary：`{{primary_label}}`
-- Subtype：`{{subtype_label}}`
-- Contributing factor：`{{contributing_factor_or_none}}`
-- Amplifier：`{{amplifier_or_none}}`
-- 终止类型：`{{termination_type}}`
+| # | Case ID | Badcase 类型 | 核心结论 | 终止类型 |
+|---:|---|---|---|---|
+| {{case_number}} | `{{case_id}}` | `{{error_type}}` | {{short_conclusion}} | {{termination_type}} |
 
 ---
 
-<!-- 为每个成功解析的 Case 重复以上三个部分。 -->
+## Case {{case_number}}：结论
 
-## 未完成分析的 Case
+> {{causal_conclusion_in_two_or_three_sentences}}
 
-| Case ID | 状态 | 原因 |
-|---|---|---|
-| `{{case_id}}` | {{parse_or_evidence_status}} | {{exact_error_or_missing_evidence}} |
+- 正确处理：{{correct_behavior_conclusion}}
+- 错误起因：{{root_cause_conclusion}}
+- 首次偏航位置：{{first_reliable_bad_word_or_phrase_and_its_semantic_effect_for_confirmed_badcase_or_boundary_unavailable}}
+- Logprob 能说明什么：{{answer_only_the_supported_logprob_questions_and_merge_the_evidence_into_a_clear_plain_language_conclusion}}
+- 模型对比结论：{{comparison_conclusion_or_insufficient_evidence}}
+- 终止结论：{{termination_conclusion}}
+- 最终归因：{{natural_language_final_attribution_explaining_state_interpretation_branch_and_result}}
+- 影响因素：{{contributing_factor_and_amplifier_in_plain_language_or_none}}
+
+---
+
+<!-- 为每个成功得出结论的 Case 重复以上结论块。
+
+首次偏航位置必须按错误形态填写：
+- 错误陈述：填写首次形成错误含义的正常词或最小短语，并说明它如何使回复进入错误语义或分支。
+- 必要内容遗漏：填写使遗漏变得不可恢复的收尾词、转折词或新动作；该词本身可以没有事实错误，但它在必需内容出现前启动了关闭或转向。
+- 无法可靠定位：填写“词级边界不可用”，说明是 token 缺失、序列不完整还是无法与回复对齐；不要强行选择最低 logprob token。
+
+Logprob 分析时，只回答当前记录能够提供证据的问题：
+1. 错误发生时，模型是在犹豫，还是明显偏向错误方向？
+2. 正确方向有没有出现在候选中？如果出现，是第几候选？
+3. 选错以后，模型是稳定沿错误路线生成，还是仍在摇摆或尝试恢复？
+4. 如果概率值饱和、token 缺失或无法与回复对齐，直接说明哪些判断无法进行。
+
+最终将证据合并成清晰的自然语言结论，不限制句数；按当前证据充分表达即可。不要输出分类标签，也不要强行回答所有问题。没有可校准证据时明确写出证据限制，不要为了填满字段推测采样影响。
+
+不要展示逐 turn 对话、完整回复原文、token 表、原始 logprob 数值或 Meta 参数表。不要用 taxonomy 标签或代码式标识代替自然语言归因。 -->
+
+## 暂无结论的 Case
+
+| Case ID | 原因 |
+|---|---|
+| `{{case_id}}` | {{exact_missing_evidence_or_parse_error}} |
 
 ## 阶段状态
 
 - Stage 1 multi-case analysis complete
 - Experiments not run
-- Experiment suggestions omitted
 - Prompt not modified
